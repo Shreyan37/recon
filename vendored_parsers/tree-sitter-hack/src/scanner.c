@@ -94,12 +94,12 @@ typedef struct {
   char *data;
 } String;
 
-static String string_new() { return (String){.cap = 16, .len = 0, .data = calloc(1, 17)}; }
+static String string_new() { return (String){.cap = 16, .len = 0, .data = (char*)calloc(1, 17)}; }
 
 static void string_resize(String *string, uint32_t cap) {
   void *tmp = realloc(string->data, (cap + 1));
   assert(tmp != NULL);
-  string->data = tmp;
+  string->data = (char*)tmp;
   memset(string->data + string->len, 0, ((cap + 1) - string->len));
   string->cap = cap;
 }
@@ -421,7 +421,7 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *expected) {
 }
 
 void *tree_sitter_hack_external_scanner_create() {
-  Scanner *scanner = calloc(1, sizeof(Scanner));
+  Scanner *scanner = (Scanner*)calloc(1, sizeof(Scanner));
   scanner->delimiter = string_new();
   return scanner;
 }
