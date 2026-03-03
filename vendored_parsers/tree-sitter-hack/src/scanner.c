@@ -1,3 +1,7 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -447,3 +451,7 @@ void tree_sitter_hack_external_scanner_destroy(void *payload) {
   string_free(&scanner->delimiter);
   free(scanner);
 }
+
+#ifdef __cplusplus
+}
+#endif
