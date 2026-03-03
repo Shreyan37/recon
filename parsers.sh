@@ -36,6 +36,10 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
 fi
 log_info "Git repository detected"
 
+# Check if we're on the correct branch (optional - adjust as needed)
+CURRENT_BRANCH=$(git branch --show-current)
+log_info "Current branch: $CURRENT_BRANCH"
+
 echo ""
 
 # =============================================================================
@@ -44,7 +48,7 @@ echo ""
 
 echo "=== Cleaning up existing parsers ==="
 
-# Remove existing parser directories
+# Remove existing parser directories (handle read-only files)
 if [ -d "vendored_parsers" ]; then
     find vendored_parsers -name "tree-sitter-*" -type d -exec chmod -R u+w {} \; 2>/dev/null || true
     rm -rf vendored_parsers/tree-sitter-*
@@ -54,7 +58,7 @@ else
     log_info "Created vendored_parsers directory"
 fi
 
-# Clean working tree
+# Clean working tree (commit or stash any changes)
 if ! git diff-index --quiet HEAD -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
     log_warn "Working tree has modifications"
     git add -A
@@ -77,7 +81,7 @@ echo ""
 # Parsers that DON'T commit parser.c (need generation)
 NO_PARSER_C=("tree-sitter-latex" "tree-sitter-janet-simple")
 
-# Parser configurations
+# Parser configurations: name, repo, branch/ref
 declare -a PARSERS=(
     "tree-sitter-commonlisp:https://github.com/theHamsta/tree-sitter-commonlisp.git:master"
     "tree-sitter-elvish:https://github.com/ckafi/tree-sitter-elvish.git:main"
@@ -103,16 +107,14 @@ requires_generation() {
     return 1
 }
 
+is_working_tree_clean() {
+    ! git diff-index --quiet HEAD -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]
+}
+
 commit_changes_if_any() {
     local message="$1"
-    local force_add="$2"  # Pass "-f" to force add ignored files
-    
     if ! git diff --cached --quiet; then
-        if [ "$force_add" = "-f" ]; then
-            git commit -m "$message"
-        else
-            git commit -m "$message"
-        fi
+        git commit -m "$message"
         return 0
     fi
     return 1
@@ -143,7 +145,7 @@ add_subtree() {
         fi
     fi
     
-    # Remove existing subtree directory if it exists
+    # Remove existing subtree directory if it exists (allows re-runs)
     if [ -d "$prefix" ]; then
         log_warn "Directory $prefix already exists, removing..."
         rm -rf "$prefix"
@@ -156,22 +158,36 @@ add_subtree() {
         rm -rf "$src_prefix"
     fi
     
-    # Add the subtree
-    echo "  Fetching from $repo ($ref)..."
-    if ! git subtree add --prefix="$prefix" "$repo" "$ref" --squash 2>&1; then
-        log_error "Failed to add $name"
-        return 1
-    fi
-    log_info "Subtree added successfully"
+    # Add the subtree with retry logic
+    local max_retries=2
+    local retry=0
+    while [ $retry -le $max_retries ]; do
+        echo "  Fetching from $repo ($ref)..."
+        if git subtree add --prefix="$prefix" "$repo" "$ref" --squash 2>&1; then
+            log_info "Subtree added successfully"
+            break
+        else
+            retry=$((retry + 1))
+            if [ $retry -le $max_retries ]; then
+                log_warn "Attempt $retry failed, retrying..."
+                sleep 2
+            else
+                log_error "Failed to add $name after $max_retries retries"
+                return 1
+            fi
+        fi
+    done
     
     # Verify src/ directory exists
     if [ ! -d "$prefix/src" ]; then
         log_error "src/ directory not found in $prefix"
+        echo "  Contents of $prefix:"
+        ls -la "$prefix" 2>/dev/null || echo "    Directory not accessible"
         return 1
     fi
     log_info "src/ directory found"
     
-    # Show src/ contents
+    # Show src/ contents for debugging
     echo "  src/ contents:"
     ls -la "$prefix/src/" | head -15
     
@@ -181,7 +197,7 @@ add_subtree() {
             log_warn "parser.c not committed, generating..."
             cd "$prefix"
             
-            # Find grammar file
+            # Find grammar file (check multiple locations)
             local grammar_location=""
             if [ -f "src/grammar.json" ]; then
                 grammar_location="src/grammar.json"
@@ -194,7 +210,7 @@ add_subtree() {
             fi
             
             if [ -z "$grammar_location" ]; then
-                log_error "No grammar file found"
+                log_error "No grammar file found (grammar.js or grammar.json)"
                 cd - > /dev/null
                 return 1
             fi
@@ -202,27 +218,19 @@ add_subtree() {
             log_info "Found grammar at: $grammar_location"
             echo "  Running: tree-sitter generate..."
             
-            if ! tree-sitter generate 2>&1; then
+            if tree-sitter generate 2>&1; then
+                log_info "Generated parser.c successfully"
+            else
                 log_error "tree-sitter generate failed"
                 cd - > /dev/null
                 return 1
             fi
             
-            log_info "Generated parser.c successfully"
             cd - > /dev/null
             
-            # KEY FIX: Force add ignored files with -f flag
-            log_warn "parser.c may be ignored by .gitignore, force adding..."
-            git add -f "$prefix/src/parser.c"
-            log_info "Force-added parser.c (ignored by .gitignore)"
-            
-            # Commit the generated file
-            if git diff --cached --quiet; then
-                log_info "No changes to commit"
-            else
-                git commit -m "chore: generate parser.c for $name"
-                log_info "Committed generated parser.c"
-            fi
+            # Commit generated parser.c
+            git add "$prefix/src/parser.c" 2>/dev/null || true
+            commit_changes_if_any "chore: generate parser.c for $name" || true
         else
             log_error "parser.c not found and $name doesn't require generation"
             return 1
