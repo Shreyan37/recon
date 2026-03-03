@@ -1,129 +1,36 @@
 #!/bin/bash
 set -e
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-log_info() { echo -e "${GREEN}✓${NC} $1"; }
-log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
-log_error() { echo -e "${RED}✗${NC} $1"; }
-
 echo "=== Regenerating all vendored_parsers ==="
+
+# Clean up existing parsers
+echo "Cleaning up existing vendored_parsers..."
+rm -rf vendored_parsers/tree-sitter-*
+git add vendored_parsers/ 2>/dev/null || true
+git commit -m "chore: remove all vendored parsers" 2>/dev/null || true
+echo "✅ Cleanup complete"
 echo ""
 
-# =============================================================================
-# PREREQUISITE CHECKS
-# =============================================================================
-
-echo "=== Prerequisite Checks ==="
-
-# Check if tree-sitter CLI is installed
-if ! command -v tree-sitter &> /dev/null; then
-    log_error "tree-sitter CLI not found!"
-    echo "  Install with: npm install -g tree-sitter-cli"
-    echo "  Or: cargo install tree-sitter-cli"
-    exit 1
-fi
-log_info "tree-sitter CLI found: $(tree-sitter --version)"
-
-# Check if we're in a git repository
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    log_error "Not in a git repository!"
-    exit 1
-fi
-log_info "Git repository detected"
-
-# Check if we're on the correct branch (optional - adjust as needed)
-CURRENT_BRANCH=$(git branch --show-current)
-log_info "Current branch: $CURRENT_BRANCH"
-
-echo ""
-
-# =============================================================================
-# CLEANUP
-# =============================================================================
-
-echo "=== Cleaning up existing parsers ==="
-
-# Remove existing parser directories (handle read-only files)
-if [ -d "vendored_parsers" ]; then
-    find vendored_parsers -name "tree-sitter-*" -type d -exec chmod -R u+w {} \; 2>/dev/null || true
-    rm -rf vendored_parsers/tree-sitter-*
-    log_info "Removed existing tree-sitter-* directories"
-else
-    mkdir -p vendored_parsers
-    log_info "Created vendored_parsers directory"
-fi
-
-# Clean working tree (commit or stash any changes)
-if ! git diff-index --quiet HEAD -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
-    log_warn "Working tree has modifications"
-    git add -A
-    if git diff --cached --quiet; then
-        log_info "No staged changes to commit"
-    else
-        git commit -m "chore: save work before regenerating vendored parsers"
-        log_info "Committed pending changes"
-    fi
-else
-    log_info "Working tree is clean"
-fi
-
-echo ""
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+echo "=== Adding tree-sitter parser subtrees ==="
 
 # Parsers that DON'T commit parser.c (need generation)
-NO_PARSER_C=("tree-sitter-latex" "tree-sitter-janet-simple")
-
-# Parser configurations: name, repo, branch/ref
-declare -a PARSERS=(
-    "tree-sitter-commonlisp:https://github.com/theHamsta/tree-sitter-commonlisp.git:master"
-    "tree-sitter-elvish:https://github.com/ckafi/tree-sitter-elvish.git:main"
-    "tree-sitter-hack:https://github.com/slackhq/tree-sitter-hack.git:main"
-    "tree-sitter-hare:https://git.sr.ht/~ecmma/tree-sitter-hare:master"
-    "tree-sitter-janet-simple:https://github.com/sogaiu/tree-sitter-janet-simple.git:master"
-    "tree-sitter-kotlin:https://github.com/fwcd/tree-sitter-kotlin.git:main"
-    "tree-sitter-latex:https://github.com/latex-lsp/tree-sitter-latex.git:master"
-    "tree-sitter-scss:https://github.com/serenadeai/tree-sitter-scss.git:master"
-    "tree-sitter-smali:https://github.com/amaanq/tree-sitter-smali.git:master"
-    "tree-sitter-vhdl:https://github.com/JLeemaster/tree-sitter-vhdl.git:main"
+NO_PARSER_C=(
+    "tree-sitter-latex"
+    "tree-sitter-janet-simple"
 )
 
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
+# Function to check if parser requires generation
 requires_generation() {
     local name="$1"
     for parser in "${NO_PARSER_C[@]}"; do
-        [[ "$name" == "$parser" ]] && return 0
+        if [[ "$name" == "$parser" ]]; then
+            return 0
+        fi
     done
     return 1
 }
 
-is_working_tree_clean() {
-    ! git diff-index --quiet HEAD -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]
-}
-
-commit_changes_if_any() {
-    local message="$1"
-    if ! git diff --cached --quiet; then
-        git commit -m "$message"
-        return 0
-    fi
-    return 1
-}
-
-# =============================================================================
-# MAIN FUNCTION
-# =============================================================================
-
+# Function to add a subtree with verification and symlink creation
 add_subtree() {
     local name="$1"
     local repo="$2"
@@ -131,232 +38,120 @@ add_subtree() {
     local prefix="vendored_parsers/${name}"
     local src_prefix="vendored_parsers/${name}-src"
     
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Adding $name (ref: $ref)"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Adding $name (ref: $ref)..."
     
-    # Ensure working tree is clean BEFORE subtree add
-    if ! git diff-index --quiet HEAD -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard)" ]; then
-        log_warn "Working tree has modifications, committing..."
+    # Ensure working tree is clean before subtree add
+    if ! git diff-index --quiet HEAD --; then
+        echo "  ⚠️  Working tree has modifications, committing..."
         git add -A
-        if ! commit_changes_if_any "chore: commit before adding $name"; then
-            log_info "No changes to commit"
-        fi
+        git commit -m "chore: commit generated files before adding $name"
     fi
     
-    # Remove existing subtree directory if it exists (allows re-runs)
-    if [ -d "$prefix" ]; then
-        log_warn "Directory $prefix already exists, removing..."
-        rm -rf "$prefix"
-        git add "$prefix" 2>/dev/null || true
-        commit_changes_if_any "chore: remove existing $name before re-adding" || true
-    fi
-    
-    # Remove existing symlink if it exists
-    if [ -L "$src_prefix" ] || [ -d "$src_prefix" ]; then
-        rm -rf "$src_prefix"
-    fi
-    
-    # Add the subtree with retry logic
-    local max_retries=2
-    local retry=0
-    while [ $retry -le $max_retries ]; do
-        echo "  Fetching from $repo ($ref)..."
-        if git subtree add --prefix="$prefix" "$repo" "$ref" --squash 2>&1; then
-            log_info "Subtree added successfully"
-            break
-        else
-            retry=$((retry + 1))
-            if [ $retry -le $max_retries ]; then
-                log_warn "Attempt $retry failed, retrying..."
-                sleep 2
-            else
-                log_error "Failed to add $name after $max_retries retries"
-                return 1
-            fi
-        fi
-    done
-    
-    # Verify src/ directory exists
-    if [ ! -d "$prefix/src" ]; then
-        log_error "src/ directory not found in $prefix"
-        echo "  Contents of $prefix:"
-        ls -la "$prefix" 2>/dev/null || echo "    Directory not accessible"
+    # Add the subtree to the main parser directory
+    if ! git subtree add --prefix="$prefix" "$repo" "$ref" --squash; then
+        echo "  ❌ Failed to add $name"
         return 1
     fi
-    log_info "src/ directory found"
     
-    # Show src/ contents for debugging
-    echo "  src/ contents:"
-    ls -la "$prefix/src/" | head -15
+    # Check what files exist in src/
+    echo "  Checking src/ contents..."
+    ls -la "$prefix/src/" | head -20
     
-    # Check if parser.c exists, generate if needed
+    # Check if parser.c exists, if not and generation is required, generate it
     if [ ! -f "$prefix/src/parser.c" ]; then
         if requires_generation "$name"; then
-            log_warn "parser.c not committed, generating..."
+            echo "  ⚠️  parser.c not committed, generating..."
             cd "$prefix"
             
-            # Find grammar file (check multiple locations)
-            local grammar_location=""
-            if [ -f "src/grammar.json" ]; then
-                grammar_location="src/grammar.json"
-            elif [ -f "grammar.js" ]; then
-                grammar_location="grammar.js"
-            elif [ -f "grammar.json" ]; then
-                grammar_location="grammar.json"
-            elif [ -f "src/grammar.js" ]; then
-                grammar_location="src/grammar.js"
-            fi
-            
-            if [ -z "$grammar_location" ]; then
-                log_error "No grammar file found (grammar.js or grammar.json)"
-                cd - > /dev/null
-                return 1
-            fi
-            
-            log_info "Found grammar at: $grammar_location"
-            echo "  Running: tree-sitter generate..."
-            
-            if tree-sitter generate 2>&1; then
-                log_info "Generated parser.c successfully"
+            # Check for grammar files
+            if [ -f "src/grammar.json" ] || [ -f "grammar.js" ] || [ -f "grammar.json" ]; then
+                if command -v tree-sitter &> /dev/null; then
+                    echo "  Running: tree-sitter generate..."
+                    if tree-sitter generate; then
+                        echo "  ✅ Generated parser.c successfully"
+                    else
+                        echo "  ❌ Failed to generate parser.c"
+                        cd - > /dev/null
+                        return 1
+                    fi
+                else
+                    echo "  ⚠️  tree-sitter CLI not installed"
+                    echo "  Install with: npm install -g tree-sitter-cli"
+                    echo "  Then manually: cd $prefix && tree-sitter generate"
+                    cd - > /dev/null
+                    return 1
+                fi
             else
-                log_error "tree-sitter generate failed"
+                echo "  ❌ No grammar file found"
                 cd - > /dev/null
                 return 1
             fi
-            
             cd - > /dev/null
             
-            # Commit generated parser.c
-            git add "$prefix/src/parser.c" 2>/dev/null || true
-            commit_changes_if_any "chore: generate parser.c for $name" || true
+            # Commit the generated parser.c to keep working tree clean
+            echo "  Committing generated parser.c..."
+            git add "$prefix/src/parser.c"
+            git commit -m "chore: generate parser.c for $name"
         else
-            log_error "parser.c not found and $name doesn't require generation"
+            echo "  ❌ parser.c not found in $prefix/src"
             return 1
         fi
     else
-        log_info "parser.c found"
+        echo "  ✅ parser.c found"
     fi
     
-    # Verify parser.c exists after generation
-    if [ ! -f "$prefix/src/parser.c" ]; then
-        log_error "parser.c still not found after generation attempt"
-        return 1
-    fi
-    
-    # Create symlink from -src to src/
+    # Create symlink from -src to src/ subdirectory (required for Cargo)
     rm -f "$src_prefix"
     ln -s "${name}/src" "$src_prefix"
-    if [ -L "$src_prefix" ]; then
-        log_info "Created symlink: $src_prefix -> ${name}/src"
-    else
-        log_error "Failed to create symlink"
-        return 1
-    fi
+    echo "  ✅ Created symlink: $src_prefix -> ${name}/src"
     
-    # Handle scanner files
-    local has_scanner=false
+    # Check for scanner files and fix tree-sitter-hack
     if [ -f "$prefix/src/scanner.c" ]; then
-        log_info "scanner.c found"
-        has_scanner=true
-        # For tree-sitter-hack, create scanner.cc symlink in -src dir
+        echo "  ✅ scanner.c found"
+        # If this is tree-sitter-hack, create scanner.cc symlink
         if [[ "$name" == "tree-sitter-hack" ]]; then
             ln -s scanner.c "$src_prefix/scanner.cc"
-            log_info "Created scanner.cc symlink for build.rs compatibility"
+            echo "  ✅ Created scanner.cc symlink for build.rs compatibility"
         fi
     elif [ -f "$prefix/src/scanner.cc" ]; then
-        log_info "scanner.cc found"
-        has_scanner=true
+        echo "  ✅ scanner.cc found"
+    else
+        echo "  ℹ️  No scanner file (some parsers don't have one)"
     fi
     
-    if [ "$has_scanner" = false ]; then
-        log_info "No scanner file (some parsers don't have one)"
-    fi
-    
-    log_info "$name added successfully ✅"
-    return 0
+    echo "  ✅ $name added successfully"
+    echo ""
 }
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
+# Add all parsers
+add_subtree "tree-sitter-commonlisp" "https://github.com/theHamsta/tree-sitter-commonlisp.git" "master"
+add_subtree "tree-sitter-elvish" "https://github.com/ckafi/tree-sitter-elvish.git" "main"
+add_subtree "tree-sitter-hack" "https://github.com/slackhq/tree-sitter-hack.git" "main"
+add_subtree "tree-sitter-hare" "https://git.sr.ht/~ecmma/tree-sitter-hare" "master"
+add_subtree "tree-sitter-janet-simple" "https://github.com/sogaiu/tree-sitter-janet-simple.git" "master"
+add_subtree "tree-sitter-kotlin" "https://github.com/fwcd/tree-sitter-kotlin.git" "main"
+add_subtree "tree-sitter-latex" "https://github.com/latex-lsp/tree-sitter-latex.git" "master"
+add_subtree "tree-sitter-scss" "https://github.com/serenadeai/tree-sitter-scss.git" "master"
+add_subtree "tree-sitter-smali" "https://github.com/amaanq/tree-sitter-smali.git" "master"
+add_subtree "tree-sitter-vhdl" "https://github.com/JLeemaster/tree-sitter-vhdl.git" "main"
 
-echo "=== Adding tree-sitter parser subtrees ==="
-
-failed_parsers=()
-successful_parsers=()
-
-for parser_config in "${PARSERS[@]}"; do
-    IFS=':' read -r name repo ref <<< "$parser_config"
-    if add_subtree "$name" "$repo" "$ref"; then
-        successful_parsers+=("$name")
-    else
-        failed_parsers+=("$name")
-        log_error "Failed to add $name - continuing with next parser..."
-    fi
-done
-
-# =============================================================================
-# FINAL SUMMARY
-# =============================================================================
-
+echo "🎉 ALL 10 subtrees processed!"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "=== FINAL SUMMARY ==="
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-echo ""
-echo "Successful (${#successful_parsers[@]}):"
-for p in "${successful_parsers[@]}"; do
-    echo "  ✅ $p"
-done
-
-if [ ${#failed_parsers[@]} -gt 0 ]; then
-    echo ""
-    echo "Failed (${#failed_parsers[@]}):"
-    for p in "${failed_parsers[@]}"; do
-        echo "  ❌ $p"
-    done
-    echo ""
-    log_warn "Some parsers failed. Fix issues and re-run script."
-    exit 1
-fi
-
-echo ""
-echo "=== Verification ==="
-echo ""
+echo "=== Final verification ==="
 echo "Symlinks:"
-ls -la vendored_parsers/*-src 2>/dev/null || echo "  No symlinks found"
-
+ls -la vendored_parsers/*-src
 echo ""
-echo "Parser files:"
+echo "Parser files check:"
 for parser in vendored_parsers/tree-sitter-*; do
     if [ -d "$parser" ] && [[ ! "$parser" == *"-src" ]]; then
         name=$(basename "$parser")
         if [ -f "$parser/src/parser.c" ]; then
-            echo "  ✅ $name: parser.c"
+            echo "  ✅ $name: parser.c exists"
         else
             echo "  ❌ $name: parser.c MISSING"
         fi
     fi
 done
-
 echo ""
-echo "=== tree-sitter-hack scanner check ==="
-if [ -L "vendored_parsers/tree-sitter-hack-src/scanner.cc" ]; then
-    echo "  ✅ scanner.cc symlink exists"
-    ls -la vendored_parsers/tree-sitter-hack-src/scanner.*
-else
-    echo "  ⚠️  scanner.cc symlink not found"
-fi
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log_info "ALL PARSERS ADDED SUCCESSFULLY! 🎉"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Next steps:"
-echo "  1. Review changes: git status"
-echo "  2. Build: cargo clean && cargo build --release"
-echo ""
+echo "Now rebuild:"
+echo "   cargo clean && cargo build --release"
