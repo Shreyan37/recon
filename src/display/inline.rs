@@ -1,5 +1,6 @@
 //! Inline, or "unified" diff display.
 
+use crate::classify::SemanticMap;
 use crate::constants::Side;
 use crate::display::context::{
     calculate_after_context, calculate_before_context, opposite_positions,
@@ -21,6 +22,8 @@ pub(crate) fn print(
     display_path: &str,
     extra_info: &Option<String>,
     file_format: &FileFormat,
+    lhs_semantic_map: Option<&SemanticMap>,
+    rhs_semantic_map: Option<&SemanticMap>,
 ) {
     let (lhs_colored_lines, rhs_colored_lines) = if display_options.use_color {
         (
@@ -31,6 +34,7 @@ pub(crate) fn print(
                 file_format,
                 display_options.background_color,
                 lhs_mps,
+                lhs_semantic_map,
             ),
             apply_colors(
                 rhs_src,
@@ -39,6 +43,7 @@ pub(crate) fn print(
                 file_format,
                 display_options.background_color,
                 rhs_mps,
+                rhs_semantic_map,
             ),
         )
     } else {
@@ -89,7 +94,6 @@ pub(crate) fn print(
             &[&before_lines[..], &hunk_lines[..]].concat(),
             &opposite_to_lhs,
             &opposite_to_rhs,
-            // TODO: repeatedly calculating the maximum is wasteful.
             lhs_src.max_line(),
             rhs_src.max_line(),
             display_options.num_context_lines as usize,

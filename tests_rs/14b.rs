@@ -1,0 +1,2 @@
+fn bar() {}
+fn foo() {}

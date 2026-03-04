@@ -42,7 +42,7 @@ use display::style::print_warning;
 use log::info;
 use options::{FilePermissions, USAGE};
 
-use crate::classify::MatchedPosExt as _; // needed for .overlaps() in classify internals
+use crate::classify::{build_semantic_map_for_side, MatchedPosExt as _};
 use crate::conflicts::{apply_conflict_markers, START_LHS_MARKER};
 use crate::diff::changes::ChangeMap;
 use crate::diff::dijkstra::ExceededGraphLimit;
@@ -289,8 +289,6 @@ fn main() {
                             }
                         }
                     } else {
-                        // Diff in parallel, print serially to prevent interleaving.
-                        // https://github.com/rayon-rs/rayon/issues/210#issuecomment-551319338
                         thread::scope(|s| {
                             let (send, recv) = std::sync::mpsc::sync_channel(1);
 
@@ -386,6 +384,8 @@ fn diff_file(
                 has_syntactic_changes: false,
                 behavioral_changes: vec![],
                 cosmetic_changes: vec![],
+                lhs_semantic_map: None,
+                rhs_semantic_map: None,
             };
         }
         (ProbableFileKind::Text(lhs_src), ProbableFileKind::Text(rhs_src)) => (lhs_src, rhs_src),
@@ -396,9 +396,6 @@ fn diff_file(
         rhs_src.retain(|c| c != '\r');
     }
 
-    // Ensure both sides have a trailing newline. This matters for text diffs
-    // where one side is missing a trailing newline: we want the last line to
-    // be considered unchanged rather than modified.
     if !lhs_src.is_empty() && !lhs_src.ends_with('\n') {
         lhs_src.push('\n');
     }
@@ -537,85 +534,11 @@ fn check_only_text(
         has_syntactic_changes: lhs_src != rhs_src,
         behavioral_changes: vec![],
         cosmetic_changes: vec![],
+        lhs_semantic_map: None,
+        rhs_semantic_map: None,
     }
 }
 
-/// Categorize novel positions into behavioral and cosmetic changes.
-///
-/// Separated from `diff_file_content` to keep the classification logic
-/// independently testable and to reduce the nesting depth of the main
-/// diff function.
-///
-/// # Double-counting avoidance
-///
-/// We only process LHS novel positions when the RHS has *none* at all,
-/// i.e. this is a pure deletion. If the RHS has novel positions, the LHS
-/// novel positions are the "before" half of paired modifications already
-/// captured via the RHS, and including them would count every modification
-/// twice.
-///
-/// # Merge order
-///
-/// 1. `merge_positions` (adjacent-only) — absorbs token sub-spans before
-///    classification so whitespace inside e.g. `"Result: "` doesn't get
-///    classified separately from its parent string.
-/// 2. Classify each merged span as behavioral or cosmetic.
-/// 3. `merge_consecutive_lines` — collapses multi-line changes (long function
-///    signatures, multiline strings) into a single representative entry
-///    anchored at the first line of the run.
-/// 4. `merge_positions_by_line` — collapses non-adjacent token fragments on
-///    the same line (e.g. `std::swap`'s opening token and closing paren) into
-///    one logical entry.
-// ============================================================
-// CHANGE 1: src/summary.rs
-// ============================================================
-// In DiffResult, change the two fields from Vec<MatchedPos> to Vec<ChangeSpan>:
-//
-//   use crate::classify::ChangeSpan;   // add this import
-//
-//   // OLD:
-//   pub(crate) behavioral_changes: Vec<MatchedPos>,
-//   pub(crate) cosmetic_changes: Vec<MatchedPos>,
-//
-//   // NEW:
-//   pub(crate) behavioral_changes: Vec<ChangeSpan>,
-//   pub(crate) cosmetic_changes: Vec<ChangeSpan>,
-//
-// Every place in the codebase that initialises these fields with vec![]
-// continues to compile unchanged because the type of an empty vec literal
-// is inferred from context.
-//
-// If display/json.rs or any other file iterates over these fields it will
-// need updating too — check for compiler errors after the change.
-
-
-// ============================================================
-// CHANGE 2: src/main.rs — replace the categorize_changes function
-// ============================================================
-
-/// Categorize novel positions into behavioral and cosmetic changes.
-///
-/// Separated from `diff_file_content` to keep classification logic
-/// independently testable.
-///
-/// # Double-counting avoidance
-///
-/// We only process LHS novel positions when the RHS has *none* at all —
-/// i.e. this is a pure deletion. If the RHS has novel positions, the LHS
-/// novel positions are the "before" half of paired modifications already
-/// captured via the RHS.
-///
-/// # Merge pipeline
-///
-/// 1. `merge_positions` (adjacent-only, returns Vec<MatchedPos>) — absorbs
-///    token sub-spans so whitespace inside e.g. `"Result: "` isn't classified
-///    separately from its parent string.
-/// 2. Classify each merged span as behavioral or cosmetic.
-/// 3. `merge_consecutive_lines` (returns Vec<ChangeSpan>) — collapses
-///    multi-line changes (deleted functions, long signatures) into a single
-///    span anchored at the first line of the run.
-/// 4. `merge_spans_by_line` — collapses non-adjacent token fragments on the
-///    same starting line into one logical entry.
 fn categorize_changes(
     lhs_positions: &[MatchedPos],
     rhs_positions: &[MatchedPos],
@@ -627,8 +550,6 @@ fn categorize_changes(
     let mut behavioral: Vec<MatchedPos> = Vec::new();
     let mut cosmetic: Vec<MatchedPos> = Vec::new();
 
-    // Pre-merge novel RHS spans before classification so sub-spans of a
-    // larger token change are absorbed before the classifiers see them.
     let novel_rhs: Vec<MatchedPos> = rhs_positions
         .iter()
         .filter(|p| p.kind.is_novel())
@@ -668,16 +589,7 @@ fn categorize_changes(
     }
 
     (
-        // merge_consecutive_lines converts Vec<MatchedPos> → Vec<ChangeSpan>,
-        // correctly tracking start/end line for multi-line deletions and
-        // additions. merge_spans_by_line then collapses token fragments on
-        // the same starting line (e.g. std::swap's opening token and closing
-        // paren both novel while arguments between them are unchanged).
         classify::merge_spans_by_line(classify::merge_consecutive_lines(behavioral)),
-        // Adjacent-only merge for cosmetic keeps distinct comment lines
-        // separate, only joining spans that are truly next to each other.
-        // Cosmetic changes are almost always single-line so
-        // merge_consecutive_lines is not needed here.
         classify::merge_consecutive_lines(classify::merge_positions(cosmetic)),
     )
 }
@@ -719,10 +631,12 @@ fn diff_file_content(
             has_syntactic_changes: false,
             behavioral_changes: vec![],
             cosmetic_changes: vec![],
+            lhs_semantic_map: None,
+            rhs_semantic_map: None,
         };
     }
 
-    let (file_format, lhs_positions, rhs_positions, behavioral_changes, cosmetic_changes) =
+    let (file_format, lhs_positions, rhs_positions, behavioral_changes, cosmetic_changes, lhs_semantic_map, rhs_semantic_map) =
         match lang_config {
             None => {
                 let file_format = FileFormat::PlainText;
@@ -737,7 +651,7 @@ fn diff_file_content(
                 }
                 let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
                 let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
-                (file_format, lhs_positions, rhs_positions, vec![], vec![])
+                (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
             }
             Some((language, lang_config)) => {
                 let arena = Arena::new();
@@ -776,6 +690,8 @@ fn diff_file_content(
                                         has_syntactic_changes,
                                         behavioral_changes: vec![],
                                         cosmetic_changes: vec![],
+                                        lhs_semantic_map: None,
+                                        rhs_semantic_map: None,
                                     };
                                 }
 
@@ -820,6 +736,8 @@ fn diff_file_content(
                                         rhs_positions,
                                         vec![],
                                         vec![],
+                                        None,
+                                        None,
                                     )
                                 } else {
                                     fix_all_sliders(language, &lhs, &mut change_map);
@@ -846,32 +764,36 @@ fn diff_file_content(
                                         rhs_positions.extend(rhs_comments);
                                     }
 
-                                    // Categorize changes into behavioral vs cosmetic.
+                                    // Fetch comment positions once, shared by both
+                                    // --summarize and --semantic-colors.
                                     //
-                                    // When --ignore-comments is active, comment positions
-                                    // have already been folded into lhs/rhs_positions above,
-                                    // so pass empty slices to avoid double-counting them.
+                                    // When --ignore-comments is active, comments have
+                                    // already been folded into lhs/rhs_positions above,
+                                    // so pass empty slices to avoid double-counting.
+                                    let need_comments = (display_options.summarize
+                                        || (display_options.semantic_colors
+                                            && display_options.use_color))
+                                        && !diff_options.ignore_comments;
+
+                                    let (lhs_comments, rhs_comments) = if need_comments {
+                                        (
+                                            tsp::comment_positions(
+                                                &lhs_tree,
+                                                lhs_src,
+                                                &lang_config,
+                                            ),
+                                            tsp::comment_positions(
+                                                &rhs_tree,
+                                                rhs_src,
+                                                &lang_config,
+                                            ),
+                                        )
+                                    } else {
+                                        (vec![], vec![])
+                                    };
+
                                     let (behavioral_changes, cosmetic_changes) =
                                         if display_options.summarize {
-                                            let lhs_comments = if diff_options.ignore_comments {
-                                                vec![]
-                                            } else {
-                                                tsp::comment_positions(
-                                                    &lhs_tree,
-                                                    lhs_src,
-                                                    &lang_config,
-                                                )
-                                            };
-                                            let rhs_comments = if diff_options.ignore_comments {
-                                                vec![]
-                                            } else {
-                                                tsp::comment_positions(
-                                                    &rhs_tree,
-                                                    rhs_src,
-                                                    &lang_config,
-                                                )
-                                            };
-
                                             categorize_changes(
                                                 &lhs_positions,
                                                 &rhs_positions,
@@ -884,12 +806,51 @@ fn diff_file_content(
                                             (vec![], vec![])
                                         };
 
+                                    // Build per-position semantic maps for
+                                    // --semantic-colors.
+                                    //
+                                    // Guards:
+                                    //   use_color  — maps are only consumed inside
+                                    //                apply_colors which is gated on
+                                    //                use_color. No point allocating for
+                                    //                --color=never.
+                                    //   !summarize — print_diff_result returns early in
+                                    //                summarize mode before reaching any
+                                    //                apply_colors call, so the maps would
+                                    //                be allocated and then dropped unused.
+                                    //
+                                    // TextFallback / PlainText / Binary files never
+                                    // reach this branch, so their maps remain None and
+                                    // apply_colors falls back to standard novel_style.
+                                    let (lhs_semantic_map, rhs_semantic_map) =
+                                        if display_options.semantic_colors
+                                            && display_options.use_color
+                                            && !display_options.summarize
+                                        {
+                                            (
+                                                Some(build_semantic_map_for_side(
+                                                    &lhs_positions,
+                                                    lhs_src,
+                                                    &lhs_comments,
+                                                )),
+                                                Some(build_semantic_map_for_side(
+                                                    &rhs_positions,
+                                                    rhs_src,
+                                                    &rhs_comments,
+                                                )),
+                                            )
+                                        } else {
+                                            (None, None)
+                                        };
+
                                     (
                                         FileFormat::SupportedLanguage(language),
                                         lhs_positions,
                                         rhs_positions,
                                         behavioral_changes,
                                         cosmetic_changes,
+                                        lhs_semantic_map,
+                                        rhs_semantic_map,
                                     )
                                 }
                             }
@@ -915,7 +876,7 @@ fn diff_file_content(
                                     line_parser::change_positions(lhs_src, rhs_src);
                                 let rhs_positions =
                                     line_parser::change_positions(rhs_src, lhs_src);
-                                (file_format, lhs_positions, rhs_positions, vec![], vec![])
+                                (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
                             }
                         }
                     }
@@ -938,7 +899,7 @@ fn diff_file_content(
                         }
                         let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
                         let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
-                        (file_format, lhs_positions, rhs_positions, vec![], vec![])
+                        (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
                     }
                 }
             }
@@ -977,6 +938,8 @@ fn diff_file_content(
         has_syntactic_changes,
         behavioral_changes,
         cosmetic_changes,
+        lhs_semantic_map,
+        rhs_semantic_map,
     }
 }
 
@@ -1090,6 +1053,8 @@ fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
                         &summary.display_path,
                         &summary.extra_info,
                         &summary.file_format,
+                        summary.lhs_semantic_map.as_ref(),
+                        summary.rhs_semantic_map.as_ref(),
                     );
                 }
                 DisplayMode::SideBySide | DisplayMode::SideBySideShowBoth => {
@@ -1103,6 +1068,8 @@ fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
                         rhs_src,
                         &summary.lhs_positions,
                         &summary.rhs_positions,
+                        summary.lhs_semantic_map.as_ref(),
+                        summary.rhs_semantic_map.as_ref(),
                     );
                 }
                 DisplayMode::Json => unreachable!(),

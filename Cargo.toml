@@ -134,7 +134,7 @@ version_check = "0.9.4"
 lto = "thin"
 
 [[bin]]
-name = "difft"
+name = "recon"
 path = "src/main.rs"
 
 [package.metadata.deb]

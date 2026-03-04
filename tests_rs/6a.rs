@@ -1,0 +1,1 @@
+struct Number(i32);

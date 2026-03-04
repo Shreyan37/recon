@@ -2,6 +2,7 @@
 
 use std::cmp::{max, min};
 
+use crate::classify::{SemanticMap, SemanticType};
 use line_numbers::{LineNumber, SingleLineSpan};
 use owo_colors::{OwoColorize, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -27,9 +28,6 @@ impl BackgroundColor {
 
 /// Find the largest byte offset in `s` that gives the longest
 /// starting substring whose display width does not exceed `width`.
-///
-/// If `s` contains full-width Unicode characters, or emoji, or tabs,
-/// its display width may be less than `width`.
 fn byte_offset_for_width(s: &str, width: usize, tab_width: usize) -> usize {
     let mut current_offset = 0;
     let mut current_width = 0;
@@ -64,8 +62,6 @@ fn substring_by_byte_replace_tabs(s: &str, start: usize, end: usize, tab_width: 
 fn width_respecting_tabs(s: &str, tab_width: usize) -> usize {
     let display_width = s.width();
 
-    // .width() on tabs returns 0, whereas we want to model them as
-    // `tab_width` spaces.
     debug_assert_eq!("\t".width(), 0);
     let tab_count = s.matches('\t').count();
     let tab_display_width_extra = tab_count * tab_width;
@@ -73,32 +69,11 @@ fn width_respecting_tabs(s: &str, tab_width: usize) -> usize {
     display_width + tab_display_width_extra
 }
 
-/// Split a string into parts whose display length does not
-/// exceed `max_width`.
-///
-/// If any part has a display width less than `max_width`, also
-/// specify the number of spaces required to pad the part to reach the
-/// desired width.
-///
-/// ```
-/// split_string_by_width("fooba", 3) // vec![("foo", 0), ("ba", 1)]
-/// ```
+/// Split a string into parts whose display length does not exceed `max_width`.
 fn split_string_by_width(s: &str, max_width: usize, tab_width: usize) -> Vec<(&str, usize)> {
     let mut parts: Vec<(&str, usize)> = vec![];
     let mut s = s;
 
-    // Optimisation: width_respecting_tabs() walks the whole string,
-    // which is slow when we have files with massive lines.
-    //
-    // A single character (grapheme) in UTF-8 can be 1, 2, 3 or 4
-    // bytes. A character's display width can be 0 (control
-    // characters), 1 (the typical case), 2 (e.g. fullwidth characters
-    // in Chinese, Japanese and Korean) or 4 (the default width for
-    // tabs in difftastic).
-    //
-    // Ignoring control characters, this means an n-byte UTF-8 string
-    // has a display width of at least n/4 characters. Check that case
-    // first, because it's a cheap conservative calculation.
     while s.len() / 4 > max_width || width_respecting_tabs(s, tab_width) > max_width {
         let offset = byte_offset_for_width(s, max_width, tab_width);
 
@@ -121,16 +96,13 @@ fn split_string_by_width(s: &str, max_width: usize, tab_width: usize) -> Vec<(&s
     parts
 }
 
-/// Return a copy of `src` with all the tab characters replaced by
-/// `tab_width` strings.
+/// Return a copy of `src` with all tab characters replaced by `tab_width` spaces.
 pub(crate) fn replace_tabs(src: &str, tab_width: usize) -> String {
     let tab_as_spaces = " ".repeat(tab_width);
     src.replace('\t', &tab_as_spaces)
 }
 
-/// Split `line` (from the source code) into multiple lines of
-/// `max_len` (i.e. word wrapping), and apply `styles` to each part
-/// according to its original position in `line`.
+/// Split `line` into multiple lines of `max_len` and apply `styles`.
 pub(crate) fn split_and_apply(
     line: &str,
     max_len: usize,
@@ -154,10 +126,8 @@ pub(crate) fn split_and_apply(
             .into_iter()
             .map(|(part, pad)| {
                 let part = replace_tabs(part, tab_width);
-
                 let mut parts = String::with_capacity(part.len() + pad);
                 parts.push_str(&part);
-
                 if matches!(side, Side::Left) {
                     parts.push_str(&" ".repeat(pad));
                 }
@@ -176,14 +146,11 @@ pub(crate) fn split_and_apply(
             let start_col = span.start_col as usize;
             let end_col = span.end_col as usize;
 
-            // The remaining spans are beyond the end of this line_part.
             if start_col >= part_start + byte_len(line_part) {
                 break;
             }
 
-            // If there's an unstyled gap before the next span.
             if start_col > part_start && prev_style_end < start_col {
-                // Then append that text without styling.
                 let unstyled_start = max(prev_style_end, part_start);
                 res.push_str(&substring_by_byte_replace_tabs(
                     line_part,
@@ -193,7 +160,6 @@ pub(crate) fn split_and_apply(
                 ));
             }
 
-            // Apply style to the substring in this span.
             if end_col > part_start {
                 let span_s = substring_by_byte_replace_tabs(
                     line_part,
@@ -206,13 +172,10 @@ pub(crate) fn split_and_apply(
             prev_style_end = end_col;
         }
 
-        // Ensure that prev_style_end is at least at the start of this
-        // line_part.
         if prev_style_end < part_start {
             prev_style_end = part_start;
         }
 
-        // Unstyled text after the last span.
         if prev_style_end < part_start + byte_len(line_part) {
             let span_s = &substring_by_byte_replace_tabs(
                 line_part,
@@ -234,8 +197,7 @@ pub(crate) fn split_and_apply(
     styled_parts
 }
 
-/// Return a copy of `line` with styles applied to all the spans
-/// specified.
+/// Return a copy of `line` with styles applied to all the spans specified.
 fn apply_line(line: &str, styles: &[(SingleLineSpan, Style)]) -> String {
     let line_bytes = byte_len(line);
     let mut styled_line = String::with_capacity(line.len());
@@ -244,24 +206,19 @@ fn apply_line(line: &str, styles: &[(SingleLineSpan, Style)]) -> String {
         let start_col = span.start_col as usize;
         let end_col = span.end_col as usize;
 
-        // The remaining spans are beyond the end of this line. This
-        // occurs when we truncate the line to fit on the display.
         if start_col >= line_bytes {
             break;
         }
 
-        // Unstyled text before the next span.
         if i < start_col {
             styled_line.push_str(substring_by_byte(line, i, start_col));
         }
 
-        // Apply style to the substring in this span.
         let span_s = substring_by_byte(line, start_col, min(line_bytes, end_col));
         styled_line.push_str(&span_s.style(*style).to_string());
         i = end_col;
     }
 
-    // Unstyled text after the last span.
     if i < line_bytes {
         let span_s = substring_by_byte(line, i, line_bytes);
         styled_line.push_str(span_s);
@@ -286,8 +243,6 @@ fn group_by_line(
 
 /// Apply the `Style`s to the spans specified. Return a vec of the
 /// styled strings, including trailing newlines.
-///
-/// Tolerant against lines in `s` being shorter than the spans.
 fn style_lines(lines: &[&str], styles: &[(SingleLineSpan, Style)]) -> Vec<String> {
     let mut ranges_by_line = group_by_line(styles);
 
@@ -319,17 +274,51 @@ pub(crate) fn novel_style(style: Style, side: Side, background: BackgroundColor)
     }
 }
 
-/// Merge spans where the end of one span matches the start of the
-/// next span.
+/// Choose the highlight color for a novel token.
 ///
-/// This reduces the number of ANSI character codes in the
-/// output. This is negligible for performance, but makes regression
-/// testing easier for difftastic.
+/// With `--semantic-colors` (`semantic_map` is `Some`):
+///   - `Behavioral` → **red on both sides** (the change matters)
+///   - `Cosmetic`   → **blue on both sides** (comments, whitespace — de-emphasised)
+///   - absent key   → falls back to standard `novel_style` (red LHS / green RHS)
 ///
-/// The file compare.expected contains hashes of the output, so it
-/// considers `<green>ab</green>` to be distinct from
-/// `<green>a</green><green>b</green>`. Merging the spans normalises
-/// the output to `<green>ab</green>`.
+/// Without `--semantic-colors` (`semantic_map` is `None`):
+///   - always falls back to `novel_style`, so behaviour is completely unchanged.
+fn novel_color(
+    style: Style,
+    side: Side,
+    background: BackgroundColor,
+    pos: &SingleLineSpan,
+    semantic_map: Option<&SemanticMap>,
+) -> Style {
+    let key = (pos.line.0, pos.start_col, pos.end_col);
+
+    match semantic_map.and_then(|m| m.get(&key)) {
+        Some(SemanticType::Behavioral) => {
+            // Red on BOTH sides — the color indicates the type of change,
+            // not which side it came from.
+            if background.is_dark() {
+                style.bright_red()
+            } else {
+                style.red()
+            }
+        }
+        Some(SemanticType::Cosmetic) => {
+            // Blue on both sides — cosmetic, de-emphasised.
+            if background.is_dark() {
+                style.bright_blue()
+            } else {
+                style.blue()
+            }
+        }
+        // No map (flag not set) or key absent: standard left=red / right=green.
+        None => novel_style(style, side, background),
+    }
+}
+
+/// Merge spans where the end of one span matches the start of the next.
+///
+/// This reduces the number of ANSI character codes in the output and
+/// normalises the output for regression testing.
 fn merge_adjacent(items: &[(SingleLineSpan, Style)]) -> Vec<(SingleLineSpan, Style)> {
     let mut merged: Vec<(SingleLineSpan, Style)> = vec![];
     let mut prev_item: Option<(SingleLineSpan, Style)> = None;
@@ -367,6 +356,7 @@ pub(crate) fn color_positions(
     syntax_highlight: bool,
     file_format: &FileFormat,
     mps: &[MatchedPos],
+    semantic_map: Option<&SemanticMap>,
 ) -> Vec<(SingleLineSpan, Style)> {
     let mut styles = vec![];
     for mp in mps {
@@ -402,7 +392,7 @@ pub(crate) fn color_positions(
                 }
             }
             MatchKind::Novel { highlight, .. } => {
-                style = novel_style(style, side, background);
+                style = novel_color(style, side, background, &mp.pos, semantic_map);
                 if syntax_highlight
                     && matches!(
                         highlight,
@@ -418,7 +408,7 @@ pub(crate) fn color_positions(
                 }
             }
             MatchKind::NovelWord { highlight } => {
-                style = novel_style(style, side, background).bold();
+                style = novel_color(style, side, background, &mp.pos, semantic_map).bold();
 
                 // Underline novel words inside comments in code, but
                 // don't apply it to every single line in plaintext.
@@ -431,7 +421,7 @@ pub(crate) fn color_positions(
                 }
             }
             MatchKind::UnchangedPartOfNovelItem { highlight, .. } => {
-                style = novel_style(style, side, background);
+                style = novel_color(style, side, background, &mp.pos, semantic_map);
                 if syntax_highlight && matches!(highlight, TokenKind::Atom(AtomKind::Comment)) {
                     style = style.italic();
                 }
@@ -450,8 +440,9 @@ pub(crate) fn apply_colors(
     file_format: &FileFormat,
     background: BackgroundColor,
     mps: &[MatchedPos],
+    semantic_map: Option<&SemanticMap>,
 ) -> Vec<String> {
-    let styles = color_positions(side, background, syntax_highlight, file_format, mps);
+    let styles = color_positions(side, background, syntax_highlight, file_format, mps, semantic_map);
     let lines = split_on_newlines(s).collect::<Vec<_>>();
     style_lines(&lines, &styles)
 }
@@ -497,8 +488,6 @@ pub(crate) fn print_warning(s: &str, display_options: &DisplayOptions) {
 
 /// Style `s` as an error and write to stderr.
 pub(crate) fn print_error(s: &str, use_color: bool) {
-    // TODO: this is inconsistent with print_warning regarding
-    // arguments and trailing whitespace.
     let prefix = if use_color {
         "error: ".red().bold().to_string()
     } else {
@@ -517,16 +506,9 @@ pub(crate) fn apply_line_number_color(
     if display_options.use_color {
         let mut style = Style::new();
 
-        // The goal here is to choose a style for line numbers that is
-        // visually distinct from content.
         if is_novel {
-            // For changed lines, show the line number as red/green
-            // and bold. This works well for syntactic diffs, where
-            // most content is not bold.
             style = novel_style(style, side, display_options.background_color).bold();
         } else {
-            // For unchanged lines, dim the line numbers so it's
-            // clearly separate from the content.
             style = style.dimmed()
         }
 

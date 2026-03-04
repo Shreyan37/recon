@@ -1,10 +1,11 @@
-//! Side-by-side (two column) display of diffs.
+//! Side-by-side (two column) display of diffs - always two columns.
 
 use std::cmp::{max, min};
 
 use line_numbers::{LineNumber, SingleLineSpan};
 use owo_colors::{OwoColorize, Style};
 
+use crate::classify::SemanticMap;
 use crate::constants::Side;
 use crate::display::context::all_matched_lines_filled;
 use crate::display::hunks::{matched_lines_indexes_for_hunk, Hunk};
@@ -52,15 +53,10 @@ fn format_missing_line_num(
     }
 
     let c = if is_continuation {
-        // Always show dots when this line is too long so we had to
-        // split it over several lines when displaying.
         "."
     } else if after_end {
-        // The file on this side has fewer lines, and we've already
-        // shown the last ones.
         " "
     } else {
-        // There are more lines in this file.
         "."
     };
 
@@ -75,7 +71,8 @@ fn format_missing_line_num(
 }
 
 /// Display `src` in a single column (e.g. a file removal or addition).
-fn display_single_column(
+/// Kept for potential external use, but no longer called internally.
+fn _display_single_column(
     display_path: &str,
     old_path: Option<&String>,
     file_format: &FileFormat,
@@ -161,17 +158,9 @@ fn display_line_nums(
 // Sizes used when displaying a hunk.
 #[derive(Debug)]
 struct SourceDimensions {
-    /// The number of characters used to display LHS source lines. Any
-    /// line that exceeds this length will be wrapped.
     lhs_content_display_width: usize,
-    /// The number of characters used to display RHS source lines. Any
-    /// line that exceeds this length will be wrapped.
     rhs_content_display_width: usize,
-    /// The number of characters required to display line numbers on
-    /// the LHS.
     lhs_line_nums_width: usize,
-    /// The number of characters required to display line numbers on
-    /// the RHS.
     rhs_line_nums_width: usize,
     lhs_max_line_in_file: LineNumber,
     rhs_max_line_in_file: LineNumber,
@@ -191,21 +180,8 @@ impl SourceDimensions {
         let rhs_line_nums_width = format_line_num(rhs_max_line_visible).len();
 
         let content_max_width = max(lhs_content_max_width, rhs_content_max_width);
-
-        // If the file lines are extremely short, treat them as if
-        // they have a line of 25 characters.
         let content_max_width = max(content_max_width, 25);
 
-        // If the terminal is very wide, we don't want to use the full
-        // 50% for the LHS column, we end up with too much space
-        // between LHS and RHS.
-        //
-        // Instead, cap the display width based on the maximum length
-        // of visible lines within the file.
-        //
-        // This naively assumes that byte length is the same as
-        // display length, which is generally OK because byte length
-        // will tend to be larger than the display length.
         let width_without_truncation = lhs_line_nums_width
             + content_max_width
             + SPACER.len()
@@ -222,9 +198,6 @@ impl SourceDimensions {
         let lhs_content_width = if lhs_line_nums_width < lhs_total_width {
             lhs_total_width - lhs_line_nums_width
         } else {
-            // The terminal is so narrow that even the column numbers
-            // display doesn't fit. Ensure we show a non-zero number
-            // of content columns anyway.
             1
         };
 
@@ -236,9 +209,6 @@ impl SourceDimensions {
                 - rhs_line_nums_width as isize,
         ) as usize;
 
-        // We want the content width to be the same on both
-        // sides. This ensures that line wrapping splits lines at the
-        // same point on both sides.
         let content_width = min(lhs_content_width, rhs_content_width);
 
         Self {
@@ -270,14 +240,15 @@ pub(crate) fn lines_with_novel(
     (lhs_lines_with_novel, rhs_lines_with_novel)
 }
 
-/// Calculate positions of highlights on both sides. This includes
-/// both syntax highlighting and added/removed content highlighting.
+/// Calculate positions of highlights on both sides.
 fn highlight_positions(
     background: BackgroundColor,
     syntax_highlight: bool,
     file_format: &FileFormat,
     lhs_mps: &[MatchedPos],
     rhs_mps: &[MatchedPos],
+    lhs_semantic_map: Option<&SemanticMap>,
+    rhs_semantic_map: Option<&SemanticMap>,
 ) -> (
     DftHashMap<LineNumber, Vec<(SingleLineSpan, Style)>>,
     DftHashMap<LineNumber, Vec<(SingleLineSpan, Style)>>,
@@ -288,8 +259,8 @@ fn highlight_positions(
         syntax_highlight,
         file_format,
         lhs_mps,
+        lhs_semantic_map,
     );
-    // Preallocate the hashmap assuming the average line will have 2 items on it.
     let mut lhs_styles: DftHashMap<LineNumber, Vec<(SingleLineSpan, Style)>> =
         DftHashMap::default();
     for (span, style) in lhs_positions {
@@ -303,6 +274,7 @@ fn highlight_positions(
         syntax_highlight,
         file_format,
         rhs_mps,
+        rhs_semantic_map,
     );
     let mut rhs_styles: DftHashMap<LineNumber, Vec<(SingleLineSpan, Style)>> =
         DftHashMap::default();
@@ -321,15 +293,11 @@ fn highlight_as_novel(
     lines_with_novel: &DftHashSet<LineNumber>,
 ) -> bool {
     if let Some(line_num) = line_num {
-        // If this line contains any novel tokens, highlight it.
         if lines_with_novel.contains(&line_num) {
             return true;
         }
 
         let line_content = lines.get(line_num.as_usize()).map(|s| str::trim(s));
-        // If this is a blank line without a corresponding line on the
-        // other side, highlight it too. This helps highlight novel
-        // blank lines.
         if line_content == Some("") && opposite_line_num.is_none() {
             return true;
         }
@@ -338,8 +306,6 @@ fn highlight_as_novel(
     false
 }
 
-/// Find the longest line in `lhs_src` and `rhs_src` that will be
-/// displayed. Return the length of that line for both LHS and RHS.
 fn visible_content_max_len_in_bytes(
     lhs_src: &str,
     rhs_src: &str,
@@ -431,6 +397,8 @@ pub(crate) fn print(
     rhs_src: &str,
     lhs_mps: &[MatchedPos],
     rhs_mps: &[MatchedPos],
+    lhs_semantic_map: Option<&SemanticMap>,
+    rhs_semantic_map: Option<&SemanticMap>,
 ) {
     let (lhs_content_max_width, rhs_content_max_width) = visible_content_max_len_in_bytes(
         lhs_src,
@@ -448,6 +416,7 @@ pub(crate) fn print(
                 file_format,
                 display_options.background_color,
                 lhs_mps,
+                lhs_semantic_map,
             ),
             apply_colors(
                 rhs_src,
@@ -456,6 +425,7 @@ pub(crate) fn print(
                 file_format,
                 display_options.background_color,
                 rhs_mps,
+                rhs_semantic_map,
             ),
         )
     } else {
@@ -469,8 +439,6 @@ pub(crate) fn print(
         )
     };
 
-    // Style positions are relative to the source code offsets. Now
-    // that we've applied styling, we can replace tabs.
     let lhs_colored_lines: Vec<_> = lhs_colored_lines
         .iter()
         .map(|l| replace_tabs(l, display_options.tab_width))
@@ -480,44 +448,7 @@ pub(crate) fn print(
         .map(|l| replace_tabs(l, display_options.tab_width))
         .collect();
 
-    if lhs_src.is_empty()
-        && !matches!(
-            display_options.display_mode,
-            DisplayMode::SideBySideShowBoth
-        )
-    {
-        for line in display_single_column(
-            display_path,
-            old_path,
-            file_format,
-            &rhs_colored_lines,
-            Side::Right,
-            display_options,
-        ) {
-            print!("{}", line);
-        }
-        println!();
-        return;
-    }
-    if rhs_src.is_empty()
-        && !matches!(
-            display_options.display_mode,
-            DisplayMode::SideBySideShowBoth
-        )
-    {
-        for line in display_single_column(
-            display_path,
-            old_path,
-            file_format,
-            &lhs_colored_lines,
-            Side::Left,
-            display_options,
-        ) {
-            print!("{}", line);
-        }
-        println!();
-        return;
-    }
+    // REMOVED: Early returns for empty files - always render side-by-side
 
     // TODO: this is largely duplicating the `apply_colors` logic.
     let (lhs_highlights, rhs_highlights) = if display_options.use_color {
@@ -527,6 +458,8 @@ pub(crate) fn print(
             file_format,
             lhs_mps,
             rhs_mps,
+            lhs_semantic_map,
+            rhs_semantic_map,
         )
     } else {
         (DftHashMap::default(), DftHashMap::default())
@@ -616,16 +549,10 @@ pub(crate) fn print(
             display_options.num_context_lines as usize,
         );
         let aligned_lines = &matched_lines_to_print[start_i..end_i];
-        // We iterate through hunks in order, so we know the next hunk
-        // must appear after start_i. This makes
-        // `matched_lines_indexes_for_hunk` faster on later
-        // iterations, and this function is hot on large textual
-        // diffs.
         matched_lines_to_print = &matched_lines_to_print[start_i..];
 
-        let no_lhs_changes = hunk.novel_lhs.is_empty();
-        let no_rhs_changes = hunk.novel_rhs.is_empty();
-        let same_lines = aligned_lines.iter().all(|(l, r)| l == r);
+        // REMOVED: no_lhs_changes/no_rhs_changes short-circuit logic
+        // Always render side-by-side regardless of change distribution
 
         for (lhs_line_num, rhs_line_num) in aligned_lines {
             let lhs_line_novel = highlight_as_novel(
@@ -652,121 +579,81 @@ pub(crate) fn print(
                 prev_rhs_line_num,
             );
 
-            let show_both = matches!(
-                display_options.display_mode,
-                DisplayMode::SideBySideShowBoth
-            );
-            if no_lhs_changes && !show_both {
-                match rhs_line_num {
-                    Some(rhs_line_num) => {
-                        let rhs_line = &rhs_colored_lines[rhs_line_num.as_usize()];
-                        if same_lines {
-                            print!("{}{}", display_rhs_line_num, rhs_line);
-                        } else {
-                            print!(
-                                "{}{}{}",
-                                display_lhs_line_num, display_rhs_line_num, rhs_line
-                            );
-                        }
-                    }
-                    None => {
-                        // We didn't have any changed RHS lines in the
-                        // hunk, but we had some contextual lines that
-                        // only occurred on the LHS (e.g. extra newlines).
-                        println!("{}{}", display_lhs_line_num, display_rhs_line_num);
-                    }
-                }
-            } else if no_rhs_changes && !show_both {
-                match lhs_line_num {
-                    Some(lhs_line_num) => {
-                        let lhs_line = &lhs_colored_lines[lhs_line_num.as_usize()];
-                        if same_lines {
-                            print!("{}{}", display_lhs_line_num, lhs_line);
-                        } else {
-                            print!(
-                                "{}{}{}",
-                                display_lhs_line_num, display_rhs_line_num, lhs_line
-                            );
-                        }
-                    }
-                    None => {
-                        println!("{}{}", display_lhs_line_num, display_rhs_line_num);
-                    }
-                }
-            } else {
-                let lhs_line = match lhs_line_num {
-                    Some(lhs_line_num) => split_and_apply(
-                        lhs_lines[lhs_line_num.as_usize()],
-                        source_dims.lhs_content_display_width,
-                        display_options.tab_width,
-                        lhs_highlights.get(lhs_line_num).unwrap_or(&vec![]),
+            // ALWAYS use side-by-side rendering path
+            let lhs_line = match lhs_line_num {
+                Some(lhs_line_num) => split_and_apply(
+                    lhs_lines[lhs_line_num.as_usize()],
+                    source_dims.lhs_content_display_width,
+                    display_options.tab_width,
+                    lhs_highlights.get(lhs_line_num).unwrap_or(&vec![]),
+                    Side::Left,
+                ),
+                None => vec![" ".repeat(source_dims.lhs_content_display_width)],
+            };
+            let rhs_line = match rhs_line_num {
+                Some(rhs_line_num) => split_and_apply(
+                    rhs_lines[rhs_line_num.as_usize()],
+                    source_dims.rhs_content_display_width,
+                    display_options.tab_width,
+                    rhs_highlights.get(rhs_line_num).unwrap_or(&vec![]),
+                    Side::Right,
+                ),
+                None => vec![" ".repeat(source_dims.rhs_content_display_width)], // Fixed: was empty string
+            };
+
+            for (i, (lhs_line, rhs_line)) in zip_pad_shorter(&lhs_line, &rhs_line)
+                .into_iter()
+                .enumerate()
+            {
+                let lhs_line = lhs_line
+                    .unwrap_or_else(|| " ".repeat(source_dims.lhs_content_display_width));
+                let rhs_line = rhs_line
+                    .unwrap_or_else(|| " ".repeat(source_dims.rhs_content_display_width)); // Fixed: was empty
+
+                let lhs_num: String = if i == 0 {
+                    display_lhs_line_num.clone()
+                } else {
+                    let mut s = format_missing_line_num(
+                        lhs_line_num
+                            .unwrap_or_else(|| prev_lhs_line_num.unwrap_or_else(|| 10.into())),
+                        &source_dims,
                         Side::Left,
-                    ),
-                    None => vec![" ".repeat(source_dims.lhs_content_display_width)],
-                };
-                let rhs_line = match rhs_line_num {
-                    Some(rhs_line_num) => split_and_apply(
-                        rhs_lines[rhs_line_num.as_usize()],
-                        source_dims.rhs_content_display_width,
-                        display_options.tab_width,
-                        rhs_highlights.get(rhs_line_num).unwrap_or(&vec![]),
-                        Side::Right,
-                    ),
-                    None => vec!["".into()],
-                };
-
-                for (i, (lhs_line, rhs_line)) in zip_pad_shorter(&lhs_line, &rhs_line)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let lhs_line = lhs_line
-                        .unwrap_or_else(|| " ".repeat(source_dims.lhs_content_display_width));
-                    let rhs_line = rhs_line.unwrap_or_else(|| "".into());
-                    let lhs_num: String = if i == 0 {
-                        display_lhs_line_num.clone()
-                    } else {
-                        let mut s = format_missing_line_num(
-                            lhs_line_num
-                                .unwrap_or_else(|| prev_lhs_line_num.unwrap_or_else(|| 10.into())),
-                            &source_dims,
+                        true,
+                        display_options.use_color,
+                    );
+                    if let Some(line_num) = lhs_line_num {
+                        s = apply_line_number_color(
+                            &s,
+                            lhs_lines_with_novel.contains(line_num),
                             Side::Left,
-                            true,
-                            display_options.use_color,
+                            display_options,
                         );
-                        if let Some(line_num) = lhs_line_num {
-                            s = apply_line_number_color(
-                                &s,
-                                lhs_lines_with_novel.contains(line_num),
-                                Side::Left,
-                                display_options,
-                            );
-                        }
-                        s
-                    };
-                    let rhs_num: String = if i == 0 {
-                        display_rhs_line_num.clone()
-                    } else {
-                        let mut s = format_missing_line_num(
-                            rhs_line_num
-                                .unwrap_or_else(|| prev_rhs_line_num.unwrap_or_else(|| 10.into())),
-                            &source_dims,
+                    }
+                    s
+                };
+                let rhs_num: String = if i == 0 {
+                    display_rhs_line_num.clone()
+                } else {
+                    let mut s = format_missing_line_num(
+                        rhs_line_num
+                            .unwrap_or_else(|| prev_rhs_line_num.unwrap_or_else(|| 10.into())),
+                        &source_dims,
+                        Side::Right,
+                        true,
+                        display_options.use_color,
+                    );
+                    if let Some(line_num) = rhs_line_num {
+                        s = apply_line_number_color(
+                            &s,
+                            rhs_lines_with_novel.contains(line_num),
                             Side::Right,
-                            true,
-                            display_options.use_color,
+                            display_options,
                         );
-                        if let Some(line_num) = rhs_line_num {
-                            s = apply_line_number_color(
-                                &s,
-                                rhs_lines_with_novel.contains(line_num),
-                                Side::Right,
-                                display_options,
-                            );
-                        }
-                        s
-                    };
+                    }
+                    s
+                };
 
-                    println!("{}{}{}{}{}", lhs_num, lhs_line, SPACER, rhs_num, rhs_line);
-                }
+                println!("{}{}{}{}{}", lhs_num, lhs_line, SPACER, rhs_num, rhs_line);
             }
 
             if lhs_line_num.is_some() {
@@ -844,8 +731,7 @@ mod tests {
 
     #[test]
     fn test_display_single_column() {
-        // Basic smoke test.
-        let res_lines = display_single_column(
+        let res_lines = _display_single_column(
             "foo.py",
             None,
             &FileFormat::SupportedLanguage(Language::Python),
@@ -859,13 +745,6 @@ mod tests {
 
     #[test]
     fn test_display_hunks() {
-        // Simulate diffing:
-        //
-        // Old:
-        // foo
-        //
-        // New:
-        // bar
         let lhs_mps = [MatchedPos {
             kind: MatchKind::Novel {
                 highlight: TokenKind::Atom(AtomKind::Normal),
@@ -899,7 +778,6 @@ mod tests {
             lines: vec![(Some(0.into()), Some(0.into()))],
         }];
 
-        // Simple smoke test.
         print(
             &hunks,
             &DisplayOptions::default(),
@@ -910,6 +788,8 @@ mod tests {
             "bar",
             &lhs_mps,
             &rhs_mps,
+            None,
+            None,
         );
     }
 }
