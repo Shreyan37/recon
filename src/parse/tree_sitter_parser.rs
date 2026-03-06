@@ -1745,6 +1745,7 @@ fn list_from_cursor<'a>(
         between_delim,
         inner_close_content,
         inner_close_position,
+        root_node.kind(),
     );
 
     if before_delim.is_empty() && after_delim.is_empty() {
@@ -1768,6 +1769,7 @@ fn list_from_cursor<'a>(
             children,
             outer_close_content,
             outer_close_position,
+            "",
         )
     }
 }
@@ -1835,6 +1837,7 @@ fn atom_from_cursor<'a>(
         position,
         content.to_owned(),
         highlight,
+        node.kind(),
     ))
 }
 

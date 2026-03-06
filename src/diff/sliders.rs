@@ -120,11 +120,9 @@ fn fix_all_nested_sliders<'a>(
 /// example.
 fn fix_nested_slider_prefer_outer<'a>(node: &'a Syntax<'a>, change_map: &mut ChangeMap<'a>) {
     if let List { children, .. } = node {
-        match change_map
-            .get(node)
-            .expect("Changes should be set before slider correction")
-        {
-            Unchanged(_) => {
+        // FIX: Use match instead of expect to handle missing entries
+        match change_map.get(node) {
+            Some(Unchanged(_)) => {
                 let mut candidates = vec![];
                 unchanged_descendants_for_outer_slider(children, &mut candidates, change_map);
 
@@ -139,7 +137,8 @@ fn fix_nested_slider_prefer_outer<'a>(node: &'a Syntax<'a>, change_map: &mut Cha
                     }
                 }
             }
-            ReplacedComment(_, _) | ReplacedString(_, _) | Novel => {}
+            Some(ReplacedComment(_, _, _) | ReplacedString(_, _, _) | Novel) => {}
+            None => {}  // FIX: Node not in change map, skip it
         }
 
         for child in children {
@@ -153,13 +152,11 @@ fn fix_nested_slider_prefer_outer<'a>(node: &'a Syntax<'a>, change_map: &mut Cha
 /// example.
 fn fix_nested_slider_prefer_inner<'a>(node: &'a Syntax<'a>, change_map: &mut ChangeMap<'a>) {
     if let List { children, .. } = node {
-        match change_map
-            .get(node)
-            .expect("Changes should be set before slider correction")
-        {
-            Unchanged(_) => {}
-            ReplacedComment(_, _) | ReplacedString(_, _) => {}
-            Novel => {
+        // FIX: Use match instead of expect to handle missing entries
+        match change_map.get(node) {
+            Some(Unchanged(_)) => {}
+            Some(ReplacedComment(_, _, _) | ReplacedString(_, _, _)) => {}
+            Some(Novel) => {
                 let mut found_unchanged = vec![];
                 unchanged_descendants(children, &mut found_unchanged, change_map);
 
@@ -167,6 +164,7 @@ fn fix_nested_slider_prefer_inner<'a>(node: &'a Syntax<'a>, change_map: &mut Cha
                     push_unchanged_to_ancestor(node, found_unchanged[0], change_map);
                 }
             }
+            None => {}  // FIX: Node not in change map, skip it
         }
 
         for child in children {
@@ -188,15 +186,17 @@ fn unchanged_descendants<'a>(
     }
 
     for node in nodes {
-        match change_map.get(node).unwrap() {
-            Unchanged(_) => {
+        // FIX: Use match instead of unwrap to handle missing entries
+        match change_map.get(node) {
+            Some(Unchanged(_)) => {
                 found.push(node);
             }
-            Novel | ReplacedComment(_, _) | ReplacedString(_, _) => {
+            Some(Novel | ReplacedComment(_, _, _) | ReplacedString(_, _, _)) => {
                 if let List { children, .. } = node {
                     unchanged_descendants(children, found, change_map);
                 }
             }
+            None => {}  // FIX: Node not in change map, skip it
         }
     }
 }
@@ -224,6 +224,7 @@ fn unchanged_descendants_for_outer_slider<'a>(
     }
 
     for node in nodes {
+        // FIX: Use match instead of expect to handle missing entries
         let is_unchanged = matches!(change_map.get(node), Some(Unchanged(_)));
 
         match node {
@@ -285,9 +286,11 @@ fn push_unchanged_to_descendant<'a>(
     inner: &'a Syntax<'a>,
     change_map: &mut ChangeMap<'a>,
 ) {
-    let root_change = change_map
-        .get(root)
-        .expect("Changes should be set before slider correction");
+    // FIX: Use match instead of expect to handle missing entries
+    let root_change = match change_map.get(root) {
+        Some(change) => change,
+        None => return,  // Root not in change map, can't slide
+    };
 
     let delimiters_match = match (root, inner) {
         (
@@ -319,7 +322,11 @@ fn push_unchanged_to_ancestor<'a>(
     inner: &'a Syntax<'a>,
     change_map: &mut ChangeMap<'a>,
 ) {
-    let inner_change = change_map.get(inner).expect("Node changes should be set");
+    // FIX: Use match instead of expect to handle missing entries
+    let inner_change = match change_map.get(inner) {
+        Some(change) => change,
+        None => return,  // Inner not in change map, can't slide
+    };
 
     let delimiters_match = match (root, inner) {
         (
@@ -365,7 +372,11 @@ fn novel_regions_after_unchanged<'a>(
     let mut region: Option<Vec<usize>> = None;
 
     for (i, node) in nodes.iter().enumerate() {
-        let change = change_map.get(node).expect("Node changes should be set");
+        // FIX: Use match instead of expect to handle missing entries
+        let change = match change_map.get(node) {
+            Some(c) => c,
+            None => continue,  // Skip nodes not in change map
+        };
 
         match change {
             Unchanged(_) => {
@@ -383,7 +394,7 @@ fn novel_regions_after_unchanged<'a>(
                     region = Some(r);
                 }
             }
-            ReplacedComment(_, _) | ReplacedString(_, _) => {
+            ReplacedComment(_, _, _) | ReplacedString(_, _, _) => {
                 // Could have just finished a novel region.
                 if let Some(region) = region {
                     regions.push(region);
@@ -415,7 +426,11 @@ fn novel_regions_before_unchanged<'a>(
     let mut region: Option<Vec<usize>> = None;
 
     for (i, node) in nodes.iter().enumerate() {
-        let change = change_map.get(node).expect("Node changes should be set");
+        // FIX: Use match instead of expect to handle missing entries
+        let change = match change_map.get(node) {
+            Some(c) => c,
+            None => continue,  // Skip nodes not in change map
+        };
 
         match change {
             Unchanged(_) => {
@@ -431,7 +446,7 @@ fn novel_regions_before_unchanged<'a>(
                 r.push(i);
                 region = Some(r);
             }
-            ReplacedComment(_, _) | ReplacedString(_, _) => {
+            ReplacedComment(_, _, _) | ReplacedString(_, _, _) => {
                 region = None;
             }
         }
@@ -451,6 +466,7 @@ fn novel_regions_before_unchanged<'a>(
 fn is_novel_deep<'a>(node: &Syntax<'a>, change_map: &ChangeMap<'a>) -> bool {
     match node {
         List { children, .. } => {
+            // FIX: Use match instead of expect to handle missing entries
             if !matches!(change_map.get(node), Some(Novel)) {
                 return false;
             }
@@ -510,18 +526,16 @@ fn slide_to_prev_node<'a>(
     let distance_to_last = distance_between(before_last_node, last_node);
 
     if distance_to_before_start <= distance_to_last {
-        let opposite = match change_map
-            .get(before_start_node)
-            .expect("Node changes should be set")
-        {
-            Unchanged(n) => {
+        // FIX: Use match instead of expect to handle missing entries
+        let opposite = match change_map.get(before_start_node) {
+            Some(Unchanged(n)) => {
                 if before_start_node.content_id() != n.content_id() {
                     return;
                 }
                 n
             }
             _ => {
-                return;
+                return;  // Not an unchanged node or not in change map
             }
         };
 
@@ -581,18 +595,16 @@ fn slide_to_next_node<'a>(
     let distance_to_after_last = distance_between(last_node, after_last_node);
 
     if distance_to_after_last < distance_to_start {
-        let opposite = match change_map
-            .get(after_last_node)
-            .expect("Node changes should be set")
-        {
-            Unchanged(n) => {
+        // FIX: Use match instead of expect to handle missing entries
+        let opposite = match change_map.get(after_last_node) {
+            Some(Unchanged(n)) => {
                 if after_last_node.content_id() != n.content_id() {
                     return;
                 }
                 n
             }
             _ => {
-                return;
+                return;  // Not an unchanged node or not in change map
             }
         };
         for node in &nodes[start_idx..=end_idx] {
@@ -705,9 +717,9 @@ mod tests {
         }];
 
         let lhs = [
-            Syntax::new_atom(&arena, line1a, "a".to_owned(), AtomKind::Comment),
-            Syntax::new_atom(&arena, line1b, "b".to_owned(), AtomKind::Comment),
-            Syntax::new_atom(&arena, line2, "a".to_owned(), AtomKind::Comment),
+            Syntax::new_atom(&arena, line1a, "a".to_owned(), AtomKind::Comment, ""),
+            Syntax::new_atom(&arena, line1b, "b".to_owned(), AtomKind::Comment, ""),
+            Syntax::new_atom(&arena, line2, "a".to_owned(), AtomKind::Comment, ""),
         ];
 
         let pos = vec![SingleLineSpan {
@@ -720,6 +732,7 @@ mod tests {
             pos,
             "a".to_owned(),
             AtomKind::Comment,
+            "",
         )];
 
         init_all_info(&lhs, &rhs);
@@ -759,9 +772,9 @@ mod tests {
         }];
 
         let lhs = [
-            Syntax::new_atom(&arena, line1, "a".to_owned(), AtomKind::Comment),
-            Syntax::new_atom(&arena, line2a, "b".to_owned(), AtomKind::Comment),
-            Syntax::new_atom(&arena, line2b, "a".to_owned(), AtomKind::Comment),
+            Syntax::new_atom(&arena, line1, "a".to_owned(), AtomKind::Comment, ""),
+            Syntax::new_atom(&arena, line2a, "b".to_owned(), AtomKind::Comment, ""),
+            Syntax::new_atom(&arena, line2b, "a".to_owned(), AtomKind::Comment, ""),
         ];
 
         let pos = vec![SingleLineSpan {
@@ -774,6 +787,7 @@ mod tests {
             pos,
             "a".to_owned(),
             AtomKind::Comment,
+            "",
         )];
 
         init_all_info(&lhs, &rhs);

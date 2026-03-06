@@ -1,14 +1,11 @@
 //! CLI option parsing.
-
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-
 use clap::{crate_authors, crate_description, value_parser, Arg, ArgAction, Command};
 use crossterm::tty::IsTty;
 use owo_colors::OwoColorize as _;
-
 use crate::display::style::{print_error, BackgroundColor};
 use crate::exit_codes::EXIT_BAD_ARGUMENTS;
 use crate::parse::guess_language::{language_override_from_name, LanguageOverride};
@@ -44,11 +41,12 @@ pub(crate) struct DisplayOptions {
     pub(crate) syntax_highlight: bool,
     pub(crate) sort_paths: bool,
     pub(crate) summarize: bool,
-    /// When true, color behavioral novel changes red and cosmetic novel
-    /// changes (comments, whitespace) blue, instead of the standard
-    /// left=red/right=green scheme. Has no effect with `--color=never` or
-    /// `--summarize`.
+    /// When true, color behavioral novel changes red and cosmetic novel changes
+    /// (comments, whitespace) blue, instead of the standard left=red/right=green
+    /// scheme. Has no effect when --color=never or --summarize is active.
     pub(crate) semantic_colors: bool,
+    /// When true, color summary output: behavioral changes red, cosmetic changes blue
+    pub(crate) summarize_colors: bool,
 }
 
 pub(crate) const DEFAULT_TERMINAL_WIDTH: usize = 80;
@@ -67,8 +65,24 @@ impl Default for DisplayOptions {
             sort_paths: false,
             summarize: false,
             semantic_colors: false,
+            summarize_colors: false,
         }
     }
+}
+
+/// Controls how aggressively semantic normalization collapses stylistically
+/// different but semantically equivalent constructs before diffing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SemanticLevel {
+    /// No semantic normalization. Default behavior.
+    #[default]
+    None,
+    /// Normalize safe single-language idioms: null constants, boolean
+    /// coercions, string formatting styles, etc.
+    Basic,
+    /// Additionally normalize structural equivalences such as loop rewrites,
+    /// function-declaration vs arrow-function, and move semantics.
+    Advanced,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +93,8 @@ pub(crate) struct DiffOptions {
     pub(crate) check_only: bool,
     pub(crate) ignore_comments: bool,
     pub(crate) strip_cr: bool,
+    /// Enable language-specific semantic normalization before diffing.
+    pub(crate) semantic_level: SemanticLevel,
 }
 
 impl Default for DiffOptions {
@@ -90,37 +106,37 @@ impl Default for DiffOptions {
             check_only: false,
             ignore_comments: false,
             strip_cr: false,
+            semantic_level: SemanticLevel::None,
         }
     }
 }
 
 fn app() -> clap::Command {
     let bin_name = env!("CARGO_BIN_NAME");
-
     let mut after_help = String::new();
     after_help
         .push_str("You can compare two files with difftastic by specifying them as arguments.\n\n");
-    after_help.push_str(&format!("$ {} old.js new.js", bin_name).bold().to_string());
+    after_help.push_str(&format!("$ {} old.js new.js\n", bin_name).bold().to_string());
 
     after_help.push_str("\n\nYou can also use directories as arguments. Difftastic will walk both directories and compare files with matching names.\n\n");
-    after_help.push_str(&format!("$ {} old/ new/", bin_name).bold().to_string());
+    after_help.push_str(&format!("$ {} old/ new/\n", bin_name).bold().to_string());
 
     after_help.push_str("\n\nIf you have a file with conflict markers, you can pass it as a single argument. Difftastic will diff the two conflicting file states.\n\n");
     after_help.push_str(
-        &format!("$ {} file_with_conflicts.js", bin_name)
+        &format!("$ {} file_with_conflicts.js\n", bin_name)
             .bold()
             .to_string(),
     );
 
     after_help.push_str("\n\nDifftastic can also be invoked with 7 or 9 arguments in the format that GIT_EXTERNAL_DIFF expects.\n\n");
     after_help.push_str(&format!(
-        "$ {} DISPLAY-PATH OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE",
+        "$ {} DISPLAY-PATH OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE\n",
         bin_name
     ));
 
     after_help.push('\n');
     after_help.push_str(&format!(
-        "$ {} OLD-NAME OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE NEW-NAME METADATA",
+        "$ {} OLD-NAME OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE NEW-NAME METADATA\n",
         bin_name
     ));
 
@@ -210,13 +226,9 @@ fn app() -> clap::Command {
                 .action(ArgAction::Set)
                 .env("DFT_DISPLAY")
                 .help("Display mode for showing results.
-
 side-by-side: Display the before file and the after file in two separate columns, with line numbers aligned according to unchanged content. If a change is exclusively additions or exclusively removals, use a single column.
-
 side-by-side-show-both: The same as side-by-side, but always uses two columns.
-
 inline: A single column display, closer to traditional diff display.
-
 json: Output the results as a machine-readable JSON array with an element per file."),
         )
         .arg(
@@ -299,30 +311,50 @@ json: Output the results as a machine-readable JSON array with an element per fi
                 .long("semantic-colors")
                 .action(ArgAction::SetTrue)
                 .env("DFT_SEMANTIC_COLORS")
-                .help("Color behavioral changes red and cosmetic changes (comments, whitespace) blue, instead of the standard left=red/right=green scheme. Has no effect with --color=never or --summarize."),
+                .help(
+                    "Color behavioral changes red and cosmetic changes (comments, whitespace) \
+                     blue, instead of the standard left=red/right=green scheme. \
+                     Has no effect with --color=never or --summarize.",
+                ),
+        )
+        .arg(
+            Arg::new("semantic-diff")
+                .long("semantic-diff")
+                .value_name("LEVEL")
+                .default_value("none")
+                .env("DFT_SEMANTIC_DIFF")
+                .help(
+                    "Apply language-specific semantic normalization before diffing. \
+                     LEVEL may be 'none' (default), 'basic' (safe idiom collapses: \
+                     null constants, boolean coercions, formatting styles), or \
+                     'advanced' (structural equivalences: loop rewrites, \
+                     function-declaration vs arrow-function).",
+                ),
+        )
+        .arg(
+            Arg::new("summarize-colors")
+                .long("summarize-colors")
+                .action(ArgAction::SetTrue)
+                .env("DFT_SUMMARIZE_COLORS")
+                .help("Show summary with colored output: behavioral changes in red, cosmetic changes in blue"),
         )
         .arg(
             Arg::new("override")
                 .long("override")
                 .value_name("GLOB:NAME")
                 .action(ArgAction::Append)
-                .help(concat!("Associate this glob pattern with this language, overriding normal language detection. For example:
-
- $ ", env!("CARGO_BIN_NAME"), " --override='*.c:C++' old.c new.c
-
-See --list-languages for the list of language names. Language names are matched case insensitively. Overrides may also specify the language \"text\" to treat a file as plain text.
-
-This argument may be given more than once. For example:
-
- $ ", env!("CARGO_BIN_NAME"), " --override='CustomFile:json' --override='*.c:text' old.c new.c
-
-To configure multiple overrides using environment variables, difftastic also accepts DFT_OVERRIDE_1 up to DFT_OVERRIDE_9.
-
- $ export DFT_OVERRIDE='CustomFile:json'
- $ export DFT_OVERRIDE_1='*.c:text'
- $ export DFT_OVERRIDE_2='*.js:javascript jsx'
-
-When multiple overrides are specified, the first matching override wins."))
+                .help(concat!(
+                    "Associate this glob pattern with this language, overriding normal language detection. For example:\n",
+                    "$ ", env!("CARGO_BIN_NAME"), " --override='*.c:C++' old.c new.c\n",
+                    "See --list-languages for the list of language names. Language names are matched case insensitively. Overrides may also specify the language \"text\" to treat a file as plain text.\n",
+                    "This argument may be given more than once. For example:\n",
+                    "$ ", env!("CARGO_BIN_NAME"), " --override='CustomFile:json' --override='*.c:text' old.c new.c\n",
+                    "To configure multiple overrides using environment variables, difftastic also accepts DFT_OVERRIDE_1 up to DFT_OVERRIDE_9.\n",
+                    "$ export DFT_OVERRIDE='CustomFile:json'\n",
+                    "$ export DFT_OVERRIDE_1='.c:text'\n",
+                    "$ export DFT_OVERRIDE_2='.js:javascript jsx'\n",
+                    "When multiple overrides are specified, the first matching override wins."
+                ))
                 .env("DFT_OVERRIDE"),
         )
         .arg(
@@ -330,19 +362,16 @@ When multiple overrides are specified, the first matching override wins."))
                 .long("override-binary")
                 .value_name("GLOB")
                 .action(ArgAction::Append)
-                .help(concat!("Treat file names matching this glob as binary files, overriding normal binary detection. For example:
-
- $ ", env!("CARGO_BIN_NAME"), " --override-binary='*.gz' old.gz new.gz
-
-This argument may be given more than once. For example:
-
- $ ", env!("CARGO_BIN_NAME"), " --override-binary='*.gz' --override-binary='foo.pickle' old.gz new.gz
-
-To configure multiple overrides using environment variables, difftastic also accepts DFT_OVERRIDE_BINARY_1 up to DFT_OVERRIDE_BINARY_9.
-
- $ export DFT_OVERRIDE_BINARY='*.gz'
- $ export DFT_OVERRIDE_BINARY_1='*.bz2'
- $ export DFT_OVERRIDE_BINARY_2='foo.pickle'"))
+                .help(concat!(
+                    "Treat file names matching this glob as binary files, overriding normal binary detection. For example:\n",
+                    "$ ", env!("CARGO_BIN_NAME"), " --override-binary='*.gz' old.gz new.gz\n",
+                    "This argument may be given more than once. For example:\n",
+                    "$ ", env!("CARGO_BIN_NAME"), " --override-binary='*.gz' --override-binary='foo.pickle' old.gz new.gz\n",
+                    "To configure multiple overrides using environment variables, difftastic also accepts DFT_OVERRIDE_BINARY_1 up to DFT_OVERRIDE_BINARY_9.\n",
+                    "$ export DFT_OVERRIDE_BINARY='.gz'\n",
+                    "$ export DFT_OVERRIDE_BINARY_1='.bz2'\n",
+                    "$ export DFT_OVERRIDE_BINARY_2='foo.pickle'"
+                ))
                 .env("DFT_OVERRIDE_BINARY"),
         )
         .arg(
@@ -366,9 +395,7 @@ To configure multiple overrides using environment variables, difftastic also acc
             Arg::new("graph-limit")
                 .long("graph-limit")
                 .value_name("LIMIT")
-                .help("Use a line-oriented diff if the internal graph exceeds this number of vertices. This limit controls the worst case runtime and memory usage for difftastic.
-
-Higher values will allow difftastic to perform a structural diff in more cases. Higher values will also increase the time before difftastic gives up on structural diffing, and increase peak memory usage.")
+                .help("Use a line-oriented diff if the internal graph exceeds this number of vertices. This limit controls the worst case runtime and memory usage for difftastic.\n\nHigher values will allow difftastic to perform a structural diff in more cases. Higher values will also increase the time before difftastic gives up on structural diffing, and increase peak memory usage.")
                 .default_value(format!("{}", DEFAULT_GRAPH_LIMIT))
                 .action(ArgAction::Set)
                 .env("DFT_GRAPH_LIMIT")
@@ -429,7 +456,6 @@ impl FileArgument {
                 if is_git_tmpfile(path) {
                     return None;
                 }
-
                 let metadata = std::fs::metadata(path).ok()?;
                 Some(metadata.permissions().into())
             }
@@ -455,7 +481,6 @@ impl Display for FilePermissions {
 
 impl TryFrom<&OsStr> for FilePermissions {
     type Error = ();
-
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
         if s == "." {
             Err(())
@@ -493,12 +518,10 @@ fn relative_to_current(path: &Path) -> PathBuf {
     if let Ok(current_path) = std::env::current_dir() {
         let path = try_canonicalize(path);
         let current_path = try_canonicalize(&current_path);
-
         if let Ok(rel_path) = path.strip_prefix(current_path) {
             return rel_path.into();
         }
     }
-
     path.into()
 }
 
@@ -619,12 +642,10 @@ fn is_git_tmpfile(path: &Path) -> bool {
     let Ok(rel_path) = path.strip_prefix(std::env::temp_dir()) else {
         return false;
     };
-
     let components: Vec<_> = rel_path.components().collect();
     if components.len() != 2 {
         return false;
     }
-
     components[0]
         .as_os_str()
         .to_string_lossy()
@@ -637,7 +658,6 @@ fn build_display_path(lhs_path: &FileArgument, rhs_path: &FileArgument) -> Strin
             if is_git_tmpfile(lhs) {
                 return rhs.display().to_string();
             }
-
             match common_path_suffix(lhs, rhs) {
                 Some(common_suffix) => common_suffix,
                 None => {
@@ -662,7 +682,6 @@ fn parse_overrides_or_die(
 ) -> Vec<(LanguageOverride, Vec<glob::Pattern>)> {
     let mut overrides: Vec<(LanguageOverride, Vec<glob::Pattern>)> = vec![];
     let mut invalid_syntax = false;
-
     for raw_override in raw_overrides {
         if let Some((glob_str, lang_name)) = raw_override.rsplit_once(':') {
             match glob::Pattern::new(glob_str) {
@@ -713,7 +732,6 @@ fn parse_overrides_or_die(
 fn parse_binary_overrides_or_die(glob_strs: &[String]) -> Vec<glob::Pattern> {
     let mut overrides: Vec<glob::Pattern> = vec![];
     let mut invalid_syntax = false;
-
     for glob_str in glob_strs {
         match glob::Pattern::new(glob_str) {
             Ok(pattern) => {
@@ -737,7 +755,6 @@ fn parse_binary_overrides_or_die(glob_strs: &[String]) -> Vec<glob::Pattern> {
 /// Parse CLI arguments passed to the binary.
 pub(crate) fn parse_args() -> Mode {
     let matches = app().get_matches();
-
     let color_output = match matches
         .get_one::<String>("color")
         .map(|s| s.as_str())
@@ -848,6 +865,7 @@ pub(crate) fn parse_args() -> Mode {
     let sort_paths = matches.get_flag("sort-paths");
     let summarize = matches.get_flag("summarize");
     let semantic_colors = matches.get_flag("semantic-colors");
+    let summarize_colors = matches.get_flag("summarize-colors");
 
     let graph_limit = *matches
         .get_one("graph-limit")
@@ -874,6 +892,15 @@ pub(crate) fn parse_args() -> Mode {
     let strip_cr = matches.get_one::<String>("strip-cr").map(|s| s.as_str()) == Some("on");
     let check_only = matches.get_flag("check-only");
 
+    let semantic_level = match matches
+        .get_one::<String>("semantic-diff")
+        .map(|s| s.as_str())
+    {
+        Some("basic") => SemanticLevel::Basic,
+        Some("advanced") => SemanticLevel::Advanced,
+        _ => SemanticLevel::None,
+    };
+
     let diff_options = DiffOptions {
         graph_limit,
         byte_limit,
@@ -881,6 +908,7 @@ pub(crate) fn parse_args() -> Mode {
         check_only,
         ignore_comments,
         strip_cr,
+        semantic_level,
     };
 
     let args = matches
@@ -952,6 +980,7 @@ pub(crate) fn parse_args() -> Mode {
                     sort_paths,
                     summarize,
                     semantic_colors,
+                    summarize_colors,
                 };
 
                 let display_path = path.to_string_lossy().to_string();
@@ -981,11 +1010,11 @@ pub(crate) fn parse_args() -> Mode {
 
                     print_error(
                         &format!(
-                            "Difftastic does not support being called with {} argument{}.\n\nYou can pass 2 arguments, or arguments in the form used by GIT_EXTERNAL_DIFF (7 or 9 arguments). See --help for more details. \n\nFor reference, difftastic was invoked as `{} {}`.\n",
+                            "Difftastic does not support being called with {} argument{}.\n\nYou can pass 2 arguments, or arguments in the form used by GIT_EXTERNAL_DIFF (7 or 9 arguments). See --help for more details.\n\nFor reference, difftastic was invoked as `{} {}`.\n",
                             args.len(),
                             if args.len() == 1 { "" } else { "s" },
                             bin_name,
-                            formatted_args.join(" "),
+                            formatted_args.join("  "),
                         ),
                         use_color,
                     );
@@ -1007,6 +1036,7 @@ pub(crate) fn parse_args() -> Mode {
         sort_paths,
         summarize,
         semantic_colors,
+        summarize_colors,
     };
 
     Mode::Diff {
@@ -1032,7 +1062,6 @@ fn detect_terminal_width() -> usize {
             return columns.into();
         }
     }
-
     if let Ok(columns_env_val) = std::env::var("COLUMNS") {
         if let Ok(columns) = columns_env_val.parse::<usize>() {
             if columns > 0 {
@@ -1040,7 +1069,6 @@ fn detect_terminal_width() -> usize {
             }
         }
     }
-
     DEFAULT_TERMINAL_WIDTH
 }
 

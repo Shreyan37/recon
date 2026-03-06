@@ -1,15 +1,11 @@
 //! Syntax tree definitions with change metadata.
-
 #![allow(clippy::mutable_key_type)] // Hash for Syntax doesn't use mutable fields.
-
 use std::cell::Cell;
 use std::hash::Hash;
 use std::num::NonZeroU32;
 use std::{env, fmt};
-
 use line_numbers::{LinePositions, SingleLineSpan};
 use typed_arena::Arena;
-
 use self::Syntax::*;
 use crate::diff::changes::ChangeKind::*;
 use crate::diff::changes::{ChangeKind, ChangeMap};
@@ -25,18 +21,18 @@ impl fmt::Debug for ChangeKind<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let desc = match self {
             Unchanged(node) => format!("Unchanged(ID: {})", node.id()),
-            ReplacedComment(lhs_node, rhs_node) | ReplacedString(lhs_node, rhs_node) => {
-                let change_kind = if let ReplacedComment(_, _) = self {
+            ReplacedComment(lhs_node, rhs_node, pct) | ReplacedString(lhs_node, rhs_node, pct) => {
+                let change_kind = if let ReplacedComment(_, _, _) = self {
                     "ReplacedComment"
                 } else {
                     "ReplacedString"
                 };
-
                 format!(
-                    "{}(lhs ID: {}, rhs ID: {})",
+                    "{}(lhs ID: {}, rhs ID: {}, similarity: {}%)",
                     change_kind,
                     lhs_node.id(),
-                    rhs_node.id()
+                    rhs_node.id(),
+                    pct
                 )
             }
             Novel => "Novel".to_owned(),
@@ -46,7 +42,6 @@ impl fmt::Debug for ChangeKind<'_> {
 }
 
 pub(crate) type SyntaxId = NonZeroU32;
-
 pub(crate) type ContentId = u32;
 
 /// Fields that are common to both `Syntax::List` and `Syntax::Atom`.
@@ -107,12 +102,19 @@ pub(crate) enum Syntax<'a> {
         close_position: Vec<SingleLineSpan>,
         close_content: String,
         num_descendants: u32,
+        /// The original tree-sitter node kind, e.g. `"match_expression"`,
+        /// `"call_expression"`, `"use_declaration"`. Empty string for
+        /// synthetic nodes created by the normalizer or difftastic internals.
+        /// Excluded from content_id so identical-content nodes still match.
+        ts_node_kind: &'static str,
     },
     Atom {
         info: SyntaxInfo<'a>,
         position: Vec<SingleLineSpan>,
         content: String,
         kind: AtomKind,
+        /// The original tree-sitter node kind. Empty string for synthetic nodes.
+        ts_node_kind: &'static str,
     },
 }
 
@@ -144,7 +146,6 @@ impl<'a> fmt::Debug for Syntax<'a> {
                     self.id(),
                     self.content_id()
                 ));
-
                 ds.field("open_content", &open_content)
                     .field("open_position", &dbg_pos(open_position))
                     .field("children", &children)
@@ -201,6 +202,7 @@ impl<'a> Syntax<'a> {
         children: Vec<&'a Self>,
         close_content: &str,
         close_position: Vec<SingleLineSpan>,
+        ts_node_kind: &'static str,
     ) -> &'a Self {
         // Skip empty atoms: they aren't displayed, so there's no
         // point making our syntax tree bigger. These occur when we're
@@ -244,6 +246,7 @@ impl<'a> Syntax<'a> {
             close_position,
             children,
             num_descendants,
+            ts_node_kind,
         })
     }
 
@@ -252,6 +255,7 @@ impl<'a> Syntax<'a> {
         mut position: Vec<SingleLineSpan>,
         mut content: String,
         kind: AtomKind,
+        ts_node_kind: &'static str,
     ) -> &'a Self {
         // If a parser hasn't cleaned up \r on CRLF files with
         // comments, discard it.
@@ -273,6 +277,7 @@ impl<'a> Syntax<'a> {
             position,
             content,
             kind,
+            ts_node_kind,
         })
     }
 
@@ -395,7 +400,6 @@ fn print_as_dot_<'a>(nodes: &[&'a Syntax<'a>]) {
                 format!("[label=\"{content}\"]")
             }
         };
-
         println!("  id{} {};", node.id().get(), label);
 
         if let List { children, .. } = node {
@@ -433,7 +437,6 @@ fn set_content_id(nodes: &[&Syntax], existing: &mut DftHashMap<ContentKey, u32>)
             } => {
                 // Recurse first, so children all have their content_id set.
                 set_content_id(children, existing);
-
                 let children_content_ids: Vec<_> =
                     children.iter().map(|c| c.info().content_id.get()).collect();
 
@@ -475,12 +478,12 @@ fn set_num_after(nodes: &[&Syntax], parent_num_after: usize) {
     for (i, node) in nodes.iter().enumerate() {
         let num_after = parent_num_after + nodes.len() - 1 - i;
         node.info().num_after.set(num_after);
-
         if let List { children, .. } = node {
             set_num_after(children, num_after);
         }
     }
 }
+
 pub(crate) fn init_next_prev<'a>(roots: &[&'a Syntax<'a>]) {
     set_prev_sibling(roots);
     set_next_sibling(roots);
@@ -523,7 +526,6 @@ fn set_content_is_unique_from_counts(nodes: &[&Syntax], counts: &DftHashMap<Cont
             .get(&node.content_id())
             .expect("Count should be present");
         node.info().content_is_unique.set(*count == 1);
-
         if let List { children, .. } = node {
             set_content_is_unique_from_counts(children, counts);
         }
@@ -538,11 +540,9 @@ fn set_content_is_unique(nodes: &[&Syntax]) {
 
 fn set_prev_sibling<'a>(nodes: &[&'a Syntax<'a>]) {
     let mut prev = None;
-
     for node in nodes {
         node.info().previous_sibling.set(prev);
         prev = Some(node);
-
         if let List { children, .. } = node {
             set_prev_sibling(children);
         }
@@ -553,7 +553,6 @@ fn set_next_sibling<'a>(nodes: &[&'a Syntax<'a>]) {
     for (i, node) in nodes.iter().enumerate() {
         let sibling = nodes.get(i + 1).copied();
         node.info().next_sibling.set(sibling);
-
         if let List { children, .. } = node {
             set_next_sibling(children);
         }
@@ -565,7 +564,6 @@ fn set_next_sibling<'a>(nodes: &[&'a Syntax<'a>]) {
 fn set_prev<'a>(nodes: &[&'a Syntax<'a>], parent: Option<&'a Syntax<'a>>) {
     for (i, node) in nodes.iter().enumerate() {
         let node_prev = if i == 0 { parent } else { Some(nodes[i - 1]) };
-
         node.info().prev.set(node_prev);
         if let List { children, .. } = node {
             set_prev(children, Some(node));
@@ -585,7 +583,6 @@ fn set_parent<'a>(nodes: &[&'a Syntax<'a>], parent: Option<&'a Syntax<'a>>) {
 fn set_num_ancestors(nodes: &[&Syntax], num_ancestors: u32) {
     for node in nodes {
         node.info().num_ancestors.set(num_ancestors);
-
         if let List { children, .. } = node {
             set_num_ancestors(children, num_ancestors + 1);
         }
@@ -599,6 +596,7 @@ impl PartialEq for Syntax<'_> {
         self.content_id() == other.content_id()
     }
 }
+
 impl<'a> Eq for Syntax<'a> {}
 
 /// Different types of strings. We want to diff these the same way,
@@ -650,14 +648,18 @@ pub(crate) enum MatchKind {
     /// For example, line-based diffs we want to highlight `a` and `b`
     /// differently to `foo` here.
     ///
+    /// ```text
     /// foo a
     /// foo b
+    /// ```
     ///
     /// Whereas for syntactic diffs, we want to do the same thing for
     /// strings and comments.
     ///
+    /// ```text
     /// "foo a"
     /// "foo b"
+    /// ```
     ///
     /// The whole string is a distinct value, but the `a` and `b` are
     /// the most interesting parts.
@@ -704,7 +706,6 @@ fn split_atom_words(
     kind: AtomKind,
 ) -> Vec<MatchedPos> {
     debug_assert!(kind == AtomKind::Comment || matches!(kind, AtomKind::String(_)));
-
     // TODO: merge adjacent single-line comments unless there are
     // blank lines between them.
     let content_parts = split_words_and_numbers(content);
@@ -788,7 +789,6 @@ fn split_atom_words(
 fn has_common_words(word_diffs: &Vec<lcs_diff::DiffResult<&&str>>) -> bool {
     let mut novel_count = 0;
     let mut unchanged_count = 0;
-
     for word_diff in word_diffs {
         match word_diff {
             lcs_diff::DiffResult::Both(word, _) => {
@@ -815,7 +815,6 @@ fn has_common_words(word_diffs: &Vec<lcs_diff::DiffResult<&&str>>) -> bool {
 /// Skip line spans at the beginning or end that have zero width.
 fn filter_empty_ends(line_spans: &[SingleLineSpan]) -> Vec<SingleLineSpan> {
     let mut spans: Vec<SingleLineSpan> = vec![];
-
     for (i, span) in line_spans.iter().enumerate() {
         if (i == 0 || i == line_spans.len() - 1) && span.start_col == span.end_col {
             continue;
@@ -833,15 +832,14 @@ impl MatchedPos {
         highlight: TokenKind,
         pos: &[SingleLineSpan],
         is_close_delim: bool,
-    ) -> Vec<Self> {
+    ) -> Vec<MatchedPos> {
         // Don't create a MatchedPos for empty positions at the start
         // or end. We still want empty positions in the middle of
         // multiline atoms, as a multiline string literal may include
         // empty lines.
         let pos = filter_empty_ends(pos);
-
         match ck {
-            ReplacedComment(this, opposite) | ReplacedString(this, opposite) => {
+            ReplacedComment(this, opposite, _) | ReplacedString(this, opposite, _) => {
                 let this_content = match this {
                     List { .. } => unreachable!(),
                     Atom { content, .. } => content,
@@ -853,7 +851,7 @@ impl MatchedPos {
                     } => (content, position),
                 };
 
-                let kind = if let ReplacedString(this, _) = ck {
+                let kind = if let ReplacedString(_, _, _) = ck {
                     match this {
                         Atom {
                             kind: AtomKind::String(StringKind::Text),
@@ -939,7 +937,6 @@ pub(crate) fn change_positions<'a>(
 ) -> Vec<MatchedPos> {
     let mut positions = Vec::new();
     let mut seen_unchanged = false;
-
     change_positions_(nodes, change_map, &mut positions, &mut seen_unchanged);
 
     // If there are no unchanged items, insert a dummy item at the
@@ -981,8 +978,7 @@ fn change_positions_<'a>(
     for node in nodes {
         let change = change_map
             .get(node)
-            .unwrap_or_else(|| panic!("Should have changes set in all nodes: {:#?}", node));
-
+            .unwrap_or(ChangeKind::Novel);
         if matches!(change, ChangeKind::Unchanged(_)) {
             *seen_unchanged = true;
         }
@@ -1027,7 +1023,6 @@ pub(crate) fn zip_pad_shorter<Tx: Clone, Ty: Clone>(
     rhs: &[Ty],
 ) -> Vec<(Option<Tx>, Option<Ty>)> {
     let mut res = vec![];
-
     let mut lhs_iter = lhs.iter();
     let mut rhs_iter = rhs.iter();
     loop {
@@ -1051,7 +1046,6 @@ pub(crate) fn zip_repeat_shorter<Tx: Clone, Ty: Clone>(lhs: &[Tx], rhs: &[Ty]) -
         Some(last) => last.clone(),
         None => return vec![],
     };
-
     let mut res = vec![];
     let mut lhs_iter = lhs.iter();
     let mut rhs_iter = rhs.iter();
@@ -1071,7 +1065,6 @@ pub(crate) fn zip_repeat_shorter<Tx: Clone, Ty: Clone>(lhs: &[Tx], rhs: &[Ty]) -
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
     use super::*;
 
     /// Consider comment atoms as distinct to other atoms even if the
@@ -1086,8 +1079,8 @@ mod tests {
 
         let arena = Arena::new();
 
-        let comment = Syntax::new_atom(&arena, pos.clone(), "foo".to_owned(), AtomKind::Comment);
-        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal);
+        let comment = Syntax::new_atom(&arena, pos.clone(), "foo".to_owned(), AtomKind::Comment, "");
+        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal, "");
         init_all_info(&[comment], &[atom]);
 
         assert_ne!(comment, atom);
@@ -1099,7 +1092,7 @@ mod tests {
         let position = vec![];
         let content = "foo\r";
 
-        let atom = Syntax::new_atom(&arena, position, content.to_owned(), AtomKind::Comment);
+        let atom = Syntax::new_atom(&arena, position, content.to_owned(), AtomKind::Comment, "");
 
         match atom {
             List { .. } => unreachable!(),
@@ -1126,7 +1119,7 @@ mod tests {
         ];
         let content = ";; hello\n";
 
-        let atom = Syntax::new_atom(&arena, position, content.to_owned(), AtomKind::Comment);
+        let atom = Syntax::new_atom(&arena, position, content.to_owned(), AtomKind::Comment, "");
 
         match atom {
             List { .. } => unreachable!(),
@@ -1159,8 +1152,8 @@ mod tests {
 
         let arena = Arena::new();
 
-        let type_atom = Syntax::new_atom(&arena, pos.clone(), "foo".to_owned(), AtomKind::Type);
-        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal);
+        let type_atom = Syntax::new_atom(&arena, pos.clone(), "foo".to_owned(), AtomKind::Type, "");
+        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal, "");
         init_all_info(&[type_atom], &[atom]);
 
         assert_eq!(type_atom, atom);
@@ -1175,9 +1168,9 @@ mod tests {
         }];
 
         let arena = Arena::new();
-        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal);
+        let atom = Syntax::new_atom(&arena, pos, "foo".to_owned(), AtomKind::Normal, "");
 
-        let trivial_list = Syntax::new_list(&arena, "", vec![], vec![atom], "", vec![]);
+        let trivial_list = Syntax::new_list(&arena, "", vec![], vec![atom], "", vec![], "");
 
         assert!(matches!(trivial_list, Atom { .. }));
     }
@@ -1191,9 +1184,9 @@ mod tests {
         }];
 
         let arena = Arena::new();
-        let atom = Syntax::new_atom(&arena, pos, "".to_owned(), AtomKind::Normal);
+        let atom = Syntax::new_atom(&arena, pos, "".to_owned(), AtomKind::Normal, "");
 
-        let trivial_list = Syntax::new_list(&arena, "(", vec![], vec![atom], ")", vec![]);
+        let trivial_list = Syntax::new_list(&arena, "(", vec![], vec![atom], ")", vec![], "");
 
         match trivial_list {
             List { children, .. } => {
@@ -1218,8 +1211,9 @@ mod tests {
             pos.clone(),
             "foo\nbar".to_owned(),
             AtomKind::Comment,
+            "",
         );
-        let y = Syntax::new_atom(&arena, pos, "foo\n    bar".to_owned(), AtomKind::Comment);
+        let y = Syntax::new_atom(&arena, pos, "foo\n    bar".to_owned(), AtomKind::Comment, "");
         init_all_info(&[x], &[y]);
 
         assert_eq!(x, y);

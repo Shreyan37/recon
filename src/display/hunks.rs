@@ -437,6 +437,13 @@ fn novel_section_in_order(
 /// Since novel positions don't have a corresponding opposite
 /// position, use the last opposite matched position to decide
 /// ordering.
+
+/// Return a vec of novel [`MatchedPos`] values in an order suited for
+/// displaying.
+///
+/// Since novel positions don't have a corresponding opposite
+/// position, use the last opposite matched position to decide
+/// ordering.
 fn sorted_novel_positions(
     lhs_mps: &[MatchedPos],
     rhs_mps: &[MatchedPos],
@@ -514,8 +521,50 @@ fn sorted_novel_positions(
             (None, None) => {
                 break;
             }
-            (lhs_mp, rhs_mp) => {
-                unreachable!("Should be impossible: every LHS Unchanged MatchedPos should have a corresponding RHS Unchanged MatchedPos\n  {:?}\n  {:?}", lhs_mp, rhs_mp);
+            // More explicit wildcard handling:
+            // This handles cases where one side has non-novel items
+            // while the other side is exhausted or has different item types.
+            // This can occur when semantic normalization creates asymmetric structures.
+            _ => {
+                // Consume whichever iterators have values
+                if lhs_iter.peek().is_some() {
+                    let lhs_mp = lhs_iter.next().unwrap();
+                    if lhs_mp.kind.is_novel() {
+                        lhs_novel_section.push(lhs_mp);
+                    } else {
+                        // Non-novel item on one side only - flush novel sections
+                        res.append(&mut novel_section_in_order(
+                            &lhs_novel_section,
+                            &rhs_novel_section,
+                            lhs_prev_matched_line,
+                            rhs_prev_matched_line,
+                            opposite_to_lhs,
+                            opposite_to_rhs,
+                        ));
+                        lhs_novel_section = vec![];
+                        rhs_novel_section = vec![];
+                        lhs_prev_matched_line = Some(lhs_mp.pos.line);
+                    }
+                }
+                if rhs_iter.peek().is_some() {
+                    let rhs_mp = rhs_iter.next().unwrap();
+                    if rhs_mp.kind.is_novel() {
+                        rhs_novel_section.push(rhs_mp);
+                    } else {
+                        // Non-novel item on one side only - flush novel sections
+                        res.append(&mut novel_section_in_order(
+                            &lhs_novel_section,
+                            &rhs_novel_section,
+                            lhs_prev_matched_line,
+                            rhs_prev_matched_line,
+                            opposite_to_lhs,
+                            opposite_to_rhs,
+                        ));
+                        lhs_novel_section = vec![];
+                        rhs_novel_section = vec![];
+                        rhs_prev_matched_line = Some(rhs_mp.pos.line);
+                    }
+                }
             }
         }
     }
@@ -531,6 +580,7 @@ fn sorted_novel_positions(
 
     res
 }
+
 
 fn next_opposite(
     line: LineNumber,

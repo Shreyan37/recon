@@ -1,15 +1,12 @@
 //! A graph representation for computing tree diffs.
-
 use std::cell::{Cell, RefCell};
 use std::cmp::min;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-
 use bumpalo::Bump;
 use hashbrown::hash_map::RawEntryMut;
 use smallvec::{smallvec, SmallVec};
 use strsim::normalized_levenshtein;
-
 use self::Edge::*;
 use crate::diff::changes::{insert_deep_unchanged, ChangeKind, ChangeMap};
 use crate::diff::stack::Stack;
@@ -25,24 +22,30 @@ use crate::parse::syntax::{AtomKind, Syntax, SyntaxId};
 /// RHS. Our start vertex looks like this.
 ///
 /// ```text
-/// LHS: X A     RHS: A
-///      ^            ^
+/// LHS: X A
+///      ^
+/// RHS: A
+///      ^
 /// ```
 ///
 /// From this vertex, we could take [`Edge::NovelAtomLHS`], bringing
 /// us to this vertex.
 ///
 /// ```text
-/// LHS: X A     RHS: A
-///        ^          ^
+/// LHS: X A
+///        ^
+/// RHS: A
+///      ^
 /// ```
 ///
 /// Alternatively, we could take the [`Edge::NovelAtomRHS`], bringing us
 /// to this vertex.
 ///
 /// ```text
-/// LHS: X A     RHS: A
-///      ^              ^
+/// LHS: X A
+///      ^
+/// RHS: A
+///        ^
 /// ```
 ///
 /// Vertices are arena allocated (the 'v lifetime) and have references
@@ -94,17 +97,16 @@ impl PartialEq for Vertex<'_, '_> {
         // case where we get a better diff by popping each side
         // separately.
         let b2 = can_pop_either_parent(&self.parents) == can_pop_either_parent(&other.parents);
-
         b0 && b1 && b2
     }
 }
+
 impl Eq for Vertex<'_, '_> {}
 
 impl Hash for Vertex<'_, '_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.lhs_syntax.map(|node| node.id()).hash(state);
         self.rhs_syntax.map(|node| node.id()).hash(state);
-
         self.lhs_parent_id.hash(state);
         self.rhs_parent_id.hash(state);
         can_pop_either_parent(&self.parents).hash(state);
@@ -154,7 +156,7 @@ fn push_both_delimiters<'s, 'v>(
     entered.push(EnteredDelimiter::PopBoth((lhs_delim, rhs_delim)), alloc)
 }
 
-fn can_pop_either_parent(entered: &Stack<EnteredDelimiter>) -> bool {
+fn can_pop_either_parent(entered: &Stack<EnteredDelimiter<'_, '_>>) -> bool {
     matches!(entered.peek(), Some(EnteredDelimiter::PopEither(_)))
 }
 
@@ -182,7 +184,6 @@ fn try_pop_lhs<'s, 'v>(
             Some(lhs_delim) => {
                 let mut entered = entered.pop().unwrap();
                 let new_lhs_delims = lhs_delims.pop().unwrap();
-
                 if !new_lhs_delims.is_empty() || !rhs_delims.is_empty() {
                     entered = entered.push(
                         EnteredDelimiter::PopEither((new_lhs_delims, rhs_delims.clone())),
@@ -207,7 +208,6 @@ fn try_pop_rhs<'s, 'v>(
             Some(rhs_delim) => {
                 let mut entered = entered.pop().unwrap();
                 let new_rhs_delims = rhs_delims.pop().unwrap();
-
                 if !lhs_delims.is_empty() || !new_rhs_delims.is_empty() {
                     entered = entered.push(
                         EnteredDelimiter::PopEither((lhs_delims.clone(), new_rhs_delims)),
@@ -322,7 +322,6 @@ impl Edge {
             } => {
                 // TODO: Perhaps prefer matching longer strings? It's
                 // probably easier to read.
-
                 // The cost for unchanged nodes can be as low as 1,
                 // but we penalise nodes that have a different depth
                 // difference, capped at 40.
@@ -370,7 +369,6 @@ fn allocate_if_new<'s, 'v>(
     match seen.raw_entry_mut().from_key(&v) {
         RawEntryMut::Occupied(mut occupied) => {
             let existing = occupied.get_mut();
-
             // Don't explore more than two possible parenthesis
             // nestings for each syntax node pair.
             if let Some(allocated) = existing.last() {
@@ -441,7 +439,6 @@ fn pop_all_parents<'s, 'v>(
     let mut lhs_parent_id = lhs_parent_id;
     let mut rhs_parent_id = rhs_parent_id;
     let mut parents = parents.clone();
-
     loop {
         if lhs_node.is_none() {
             if let Some((lhs_parent, parents_next)) = try_pop_lhs(&parents, alloc) {
@@ -498,7 +495,6 @@ pub(crate) fn set_neighbours<'s, 'v>(
     if v.neighbours.borrow().is_some() {
         return;
     }
-
     // There are only seven pushes in this function, so that's sufficient.
     let mut neighbours: Vec<(Edge, &Vertex)> = Vec::with_capacity(7);
 
@@ -784,6 +780,7 @@ pub(crate) fn set_neighbours<'s, 'v>(
             }
         }
     }
+
     assert!(
         !neighbours.is_empty(),
         "Must always find some next steps if node is not the end"
@@ -803,7 +800,6 @@ pub(crate) fn populate_change_map<'s, 'v>(
                 // No change on this node or its children.
                 let lhs = v.lhs_syntax.unwrap();
                 let rhs = v.rhs_syntax.unwrap();
-
                 insert_deep_unchanged(lhs, rhs, change_map);
                 insert_deep_unchanged(rhs, lhs, change_map);
             }
@@ -820,9 +816,9 @@ pub(crate) fn populate_change_map<'s, 'v>(
                 let rhs = v.rhs_syntax.unwrap();
                 let change_kind = |first, second| {
                     if let ReplacedComment { .. } = e {
-                        ChangeKind::ReplacedComment(first, second)
+                        ChangeKind::ReplacedComment(first, second, *levenshtein_pct)
                     } else {
-                        ChangeKind::ReplacedString(first, second)
+                        ChangeKind::ReplacedString(first, second, *levenshtein_pct)
                     }
                 };
 

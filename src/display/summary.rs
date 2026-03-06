@@ -7,6 +7,7 @@ use crate::classify::ChangeSpan;
 use crate::display::style;
 use crate::options::DisplayOptions;
 use crate::summary::{DiffResult, FileFormat};
+use owo_colors::OwoColorize;
 
 /// Format a `ChangeSpan` for display.
 ///
@@ -113,22 +114,40 @@ pub fn print_summary(diff_result: &DiffResult, display_options: &DisplayOptions)
     }
 
     if behavioral_count > 0 {
-        println!(
-            "{} behavioral {}:",
-            behavioral_count,
-            if behavioral_count == 1 { "change" } else { "changes" }
-        );
+        let behavior_label = if display_options.summarize_colors && display_options.use_color {
+            format!(
+                "{} behavioral {}:",
+                behavioral_count.to_string().red(),
+                if behavioral_count == 1 { "change" } else { "changes" }
+            )
+        } else {
+            format!(
+                "{} behavioral {}:",
+                behavioral_count,
+                if behavioral_count == 1 { "change" } else { "changes" }
+            )
+        };
+        println!("{}", behavior_label);
         for span in &diff_result.behavioral_changes {
             println!("  {}", format_span(span));
         }
     }
 
     if cosmetic_count > 0 {
-        println!(
-            "{} cosmetic {}:",
-            cosmetic_count,
-            if cosmetic_count == 1 { "change" } else { "changes" }
-        );
+        let cosmetic_label = if display_options.summarize_colors && display_options.use_color {
+            format!(
+                "{} cosmetic {}:",
+                cosmetic_count.to_string().blue(),
+                if cosmetic_count == 1 { "change" } else { "changes" }
+            )
+        } else {
+            format!(
+                "{} cosmetic {}:",
+                cosmetic_count,
+                if cosmetic_count == 1 { "change" } else { "changes" }
+            )
+        };
+        println!("{}", cosmetic_label);
         for span in &diff_result.cosmetic_changes {
             println!("  {}", format_span(span));
         }

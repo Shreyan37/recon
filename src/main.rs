@@ -539,6 +539,12 @@ fn check_only_text(
     }
 }
 
+/// Categorize novel positions into behavioral and cosmetic changes.
+///
+/// FIX 1: Added `classify::is_import_change` and `classify::is_formatting_change`
+/// to the classification chain so import-only diffs and trailing-comma diffs are
+/// reported as cosmetic in `--summarize` mode, consistent with how
+/// `build_semantic_map_for_side` classifies them for `--semantic-colors`.
 fn categorize_changes(
     lhs_positions: &[MatchedPos],
     rhs_positions: &[MatchedPos],
@@ -558,18 +564,20 @@ fn categorize_changes(
     let merged_rhs = classify::merge_positions(novel_rhs);
 
     for pos in &merged_rhs {
-        if classify::is_comment_change(pos, rhs_comments) {
-            cosmetic.push(pos.clone());
-        } else if classify::is_whitespace_only_change(pos, rhs_src) {
+        if classify::is_comment_change(pos, rhs_comments)
+            || classify::is_whitespace_only_change(pos, rhs_src)
+            || classify::is_import_change(pos, rhs_src)
+            || classify::is_formatting_change(pos, rhs_src)
+        {
             cosmetic.push(pos.clone());
         } else {
             behavioral.push(pos.clone());
         }
     }
 
-    // Pure deletions only: process LHS.
     let has_rhs_novel = rhs_positions.iter().any(|p| p.kind.is_novel());
     if !has_rhs_novel {
+        // Pure deletion (nothing added on RHS): classify LHS removals.
         let novel_lhs: Vec<MatchedPos> = lhs_positions
             .iter()
             .filter(|p| p.kind.is_novel())
@@ -578,11 +586,36 @@ fn categorize_changes(
         let merged_lhs = classify::merge_positions(novel_lhs);
 
         for pos in &merged_lhs {
-            if classify::is_comment_change(pos, lhs_comments) {
-                cosmetic.push(pos.clone());
-            } else if classify::is_whitespace_only_change(pos, lhs_src) {
+            if classify::is_comment_change(pos, lhs_comments)
+                || classify::is_whitespace_only_change(pos, lhs_src)
+                || classify::is_import_change(pos, lhs_src)
+                || classify::is_formatting_change(pos, lhs_src)
+            {
                 cosmetic.push(pos.clone());
             } else {
+                behavioral.push(pos.clone());
+            }
+        }
+    } else {
+        // Both sides have changes: also count LHS behavioral deletions so
+        // that --summarize doesn't miss removed code (e.g. a deleted
+        // security check).
+        let novel_lhs: Vec<MatchedPos> = lhs_positions
+            .iter()
+            .filter(|p| p.kind.is_novel())
+            .cloned()
+            .collect();
+        let merged_lhs = classify::merge_positions(novel_lhs);
+
+        for pos in &merged_lhs {
+            // Only track behavioral deletions on LHS — cosmetic-only
+            // removals (comments, imports) are already captured via RHS
+            // additions and don't need double-counting.
+            let is_cosmetic = classify::is_comment_change(pos, lhs_comments)
+                || classify::is_whitespace_only_change(pos, lhs_src)
+                || classify::is_import_change(pos, lhs_src)
+                || classify::is_formatting_change(pos, lhs_src);
+            if !is_cosmetic {
                 behavioral.push(pos.clone());
             }
         }
@@ -636,274 +669,246 @@ fn diff_file_content(
         };
     }
 
-    let (file_format, lhs_positions, rhs_positions, behavioral_changes, cosmetic_changes, lhs_semantic_map, rhs_semantic_map) =
-        match lang_config {
-            None => {
-                let file_format = FileFormat::PlainText;
-                if diff_options.check_only {
-                    return check_only_text(
-                        &file_format,
-                        display_path,
-                        extra_info,
+    let (
+        file_format,
+        lhs_positions,
+        rhs_positions,
+        behavioral_changes,
+        cosmetic_changes,
+        lhs_semantic_map,
+        rhs_semantic_map,
+    ) = match lang_config {
+        None => {
+            let file_format = FileFormat::PlainText;
+            if diff_options.check_only {
+                return check_only_text(&file_format, display_path, extra_info, lhs_src, rhs_src);
+            }
+            let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+            let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+            (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
+        }
+        Some((language, lang_config)) => {
+            let arena = Arena::new();
+            match tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src) {
+                Ok((lhs_tree, rhs_tree)) => {
+                    match tsp::to_syntax_with_limit(
                         lhs_src,
                         rhs_src,
-                    );
-                }
-                let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
-                let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
-                (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
-            }
-            Some((language, lang_config)) => {
-                let arena = Arena::new();
-                match tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src) {
-                    Ok((lhs_tree, rhs_tree)) => {
-                        match tsp::to_syntax_with_limit(
-                            lhs_src,
-                            rhs_src,
-                            &lhs_tree,
-                            &rhs_tree,
-                            &arena,
-                            &lang_config,
-                            diff_options,
-                        ) {
-                            Ok((lhs, rhs)) => {
-                                if diff_options.check_only {
-                                    let has_syntactic_changes = lhs != rhs;
-                                    let has_byte_changes = if lhs_src == rhs_src {
-                                        None
-                                    } else {
-                                        Some((
-                                            lhs_src.as_bytes().len(),
-                                            rhs_src.as_bytes().len(),
-                                        ))
-                                    };
-                                    return DiffResult {
-                                        extra_info,
-                                        display_path: display_path.to_owned(),
-                                        file_format: FileFormat::SupportedLanguage(language),
-                                        lhs_src: FileContent::Text(lhs_src.to_owned()),
-                                        rhs_src: FileContent::Text(rhs_src.to_owned()),
-                                        lhs_positions: vec![],
-                                        rhs_positions: vec![],
-                                        hunks: vec![],
-                                        has_byte_changes,
-                                        has_syntactic_changes,
-                                        behavioral_changes: vec![],
-                                        cosmetic_changes: vec![],
-                                        lhs_semantic_map: None,
-                                        rhs_semantic_map: None,
-                                    };
-                                }
+                        &lhs_tree,
+                        &rhs_tree,
+                        &arena,
+                        &lang_config,
+                        diff_options,
+                    ) {
+                        Ok((mut lhs, mut rhs)) => {
+                            // Semantic normalization: rewrite stylistically
+                            // different but semantically equivalent subtrees
+                            // to a shared canonical form so the diff engine
+                            // marks them as Unchanged.
+                            if diff_options.semantic_level != crate::options::SemanticLevel::None {
+                                crate::parse::semantic_normalizer::normalize_all(
+                                    language,
+                                    &mut lhs,
+                                    &mut rhs,
+                                    &arena,
+                                );
+                            }
 
-                                let mut change_map = ChangeMap::default();
-                                let possibly_changed =
-                                    if env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
-                                        vec![(lhs.clone(), rhs.clone())]
-                                    } else {
-                                        unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
-                                    };
+                            if diff_options.check_only {
+                                let has_syntactic_changes = lhs != rhs;
+                                let has_byte_changes = if lhs_src == rhs_src {
+                                    None
+                                } else {
+                                    Some((lhs_src.as_bytes().len(), rhs_src.as_bytes().len()))
+                                };
+                                return DiffResult {
+                                    extra_info,
+                                    display_path: display_path.to_owned(),
+                                    file_format: FileFormat::SupportedLanguage(language),
+                                    lhs_src: FileContent::Text(lhs_src.to_owned()),
+                                    rhs_src: FileContent::Text(rhs_src.to_owned()),
+                                    lhs_positions: vec![],
+                                    rhs_positions: vec![],
+                                    hunks: vec![],
+                                    has_byte_changes,
+                                    has_syntactic_changes,
+                                    behavioral_changes: vec![],
+                                    cosmetic_changes: vec![],
+                                    lhs_semantic_map: None,
+                                    rhs_semantic_map: None,
+                                };
+                            }
 
-                                let mut exceeded_graph_limit = false;
+                            let mut change_map = ChangeMap::default();
+                            let possibly_changed = if env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
+                                vec![(lhs.clone(), rhs.clone())]
+                            } else {
+                                unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
+                            };
 
-                                for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
-                                    init_next_prev(&lhs_section_nodes);
-                                    init_next_prev(&rhs_section_nodes);
+                            let mut exceeded_graph_limit = false;
 
-                                    match mark_syntax(
-                                        lhs_section_nodes.first().copied(),
-                                        rhs_section_nodes.first().copied(),
-                                        &mut change_map,
-                                        diff_options.graph_limit,
-                                    ) {
-                                        Ok(()) => {}
-                                        Err(ExceededGraphLimit {}) => {
-                                            exceeded_graph_limit = true;
-                                            break;
-                                        }
+                            for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
+                                init_next_prev(&lhs_section_nodes);
+                                init_next_prev(&rhs_section_nodes);
+
+                                match mark_syntax(
+                                    lhs_section_nodes.first().copied(),
+                                    rhs_section_nodes.first().copied(),
+                                    &mut change_map,
+                                    diff_options.graph_limit,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(ExceededGraphLimit {}) => {
+                                        exceeded_graph_limit = true;
+                                        break;
                                     }
                                 }
+                            }
 
-                                if exceeded_graph_limit {
-                                    let lhs_positions =
-                                        line_parser::change_positions(lhs_src, rhs_src);
-                                    let rhs_positions =
-                                        line_parser::change_positions(rhs_src, lhs_src);
+                            if exceeded_graph_limit {
+                                let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                                let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                                (
+                                    FileFormat::TextFallback {
+                                        reason: "exceeded DFT_GRAPH_LIMIT".into(),
+                                    },
+                                    lhs_positions,
+                                    rhs_positions,
+                                    vec![],
+                                    vec![],
+                                    None,
+                                    None,
+                                )
+                            } else {
+                                fix_all_sliders(language, &lhs, &mut change_map);
+                                fix_all_sliders(language, &rhs, &mut change_map);
+
+                                let mut lhs_positions = syntax::change_positions(&lhs, &change_map);
+                                let mut rhs_positions = syntax::change_positions(&rhs, &change_map);
+
+                                if diff_options.ignore_comments {
+                                    let lhs_comments = tsp::comment_positions(
+                                        &lhs_tree, lhs_src, &lang_config,
+                                    );
+                                    lhs_positions.extend(lhs_comments);
+
+                                    let rhs_comments = tsp::comment_positions(
+                                        &rhs_tree, rhs_src, &lang_config,
+                                    );
+                                    rhs_positions.extend(rhs_comments);
+                                }
+
+                                // Fetch comment positions once, shared by both
+                                // --summarize and --semantic-colors.
+                                let need_comments = (display_options.summarize
+                                    || (display_options.semantic_colors
+                                        && display_options.use_color))
+                                    && !diff_options.ignore_comments;
+
+                                let (lhs_comments, rhs_comments) = if need_comments {
                                     (
-                                        FileFormat::TextFallback {
-                                            reason: "exceeded DFT_GRAPH_LIMIT".into(),
-                                        },
-                                        lhs_positions,
-                                        rhs_positions,
-                                        vec![],
-                                        vec![],
-                                        None,
-                                        None,
+                                        tsp::comment_positions(&lhs_tree, lhs_src, &lang_config),
+                                        tsp::comment_positions(&rhs_tree, rhs_src, &lang_config),
                                     )
                                 } else {
-                                    fix_all_sliders(language, &lhs, &mut change_map);
-                                    fix_all_sliders(language, &rhs, &mut change_map);
+                                    (vec![], vec![])
+                                };
 
-                                    let mut lhs_positions =
-                                        syntax::change_positions(&lhs, &change_map);
-                                    let mut rhs_positions =
-                                        syntax::change_positions(&rhs, &change_map);
-
-                                    if diff_options.ignore_comments {
-                                        let lhs_comments = tsp::comment_positions(
-                                            &lhs_tree,
+                                let (behavioral_changes, cosmetic_changes) =
+                                    if display_options.summarize {
+                                        categorize_changes(
+                                            &lhs_positions,
+                                            &rhs_positions,
                                             lhs_src,
-                                            &lang_config,
-                                        );
-                                        lhs_positions.extend(lhs_comments);
-
-                                        let rhs_comments = tsp::comment_positions(
-                                            &rhs_tree,
                                             rhs_src,
-                                            &lang_config,
-                                        );
-                                        rhs_positions.extend(rhs_comments);
-                                    }
-
-                                    // Fetch comment positions once, shared by both
-                                    // --summarize and --semantic-colors.
-                                    //
-                                    // When --ignore-comments is active, comments have
-                                    // already been folded into lhs/rhs_positions above,
-                                    // so pass empty slices to avoid double-counting.
-                                    let need_comments = (display_options.summarize
-                                        || (display_options.semantic_colors
-                                            && display_options.use_color))
-                                        && !diff_options.ignore_comments;
-
-                                    let (lhs_comments, rhs_comments) = if need_comments {
-                                        (
-                                            tsp::comment_positions(
-                                                &lhs_tree,
-                                                lhs_src,
-                                                &lang_config,
-                                            ),
-                                            tsp::comment_positions(
-                                                &rhs_tree,
-                                                rhs_src,
-                                                &lang_config,
-                                            ),
+                                            &lhs_comments,
+                                            &rhs_comments,
                                         )
                                     } else {
                                         (vec![], vec![])
                                     };
 
-                                    let (behavioral_changes, cosmetic_changes) =
-                                        if display_options.summarize {
-                                            categorize_changes(
+                                // FIX 2 & 3: build_semantic_map_for_side now takes two extra
+                                // optional arguments: change_map and syntax_nodes. Pass the
+                                // change_map for ReplacedComment/ReplacedString detection.
+                                // syntax_nodes are the flat node slices from lhs/rhs.
+                                let (lhs_semantic_map, rhs_semantic_map) =
+                                    if display_options.semantic_colors
+                                        && display_options.use_color
+                                        && !display_options.summarize
+                                    {
+                                        (
+                                            Some(build_semantic_map_for_side(
                                                 &lhs_positions,
-                                                &rhs_positions,
                                                 lhs_src,
-                                                rhs_src,
                                                 &lhs_comments,
+                                                Some(&change_map),
+                                                Some(lhs.as_slice()),
+                                            )),
+                                            Some(build_semantic_map_for_side(
+                                                &rhs_positions,
+                                                rhs_src,
                                                 &rhs_comments,
-                                            )
-                                        } else {
-                                            (vec![], vec![])
-                                        };
+                                                Some(&change_map),
+                                                Some(rhs.as_slice()),
+                                            )),
+                                        )
+                                    } else {
+                                        (None, None)
+                                    };
 
-                                    // Build per-position semantic maps for
-                                    // --semantic-colors.
-                                    //
-                                    // Guards:
-                                    //   use_color  — maps are only consumed inside
-                                    //                apply_colors which is gated on
-                                    //                use_color. No point allocating for
-                                    //                --color=never.
-                                    //   !summarize — print_diff_result returns early in
-                                    //                summarize mode before reaching any
-                                    //                apply_colors call, so the maps would
-                                    //                be allocated and then dropped unused.
-                                    //
-                                    // TextFallback / PlainText / Binary files never
-                                    // reach this branch, so their maps remain None and
-                                    // apply_colors falls back to standard novel_style.
-                                    let (lhs_semantic_map, rhs_semantic_map) =
-                                        if display_options.semantic_colors
-                                            && display_options.use_color
-                                            && !display_options.summarize
-                                        {
-                                            (
-                                                Some(build_semantic_map_for_side(
-                                                    &lhs_positions,
-                                                    lhs_src,
-                                                    &lhs_comments,
-                                                )),
-                                                Some(build_semantic_map_for_side(
-                                                    &rhs_positions,
-                                                    rhs_src,
-                                                    &rhs_comments,
-                                                )),
-                                            )
-                                        } else {
-                                            (None, None)
-                                        };
-
-                                    (
-                                        FileFormat::SupportedLanguage(language),
-                                        lhs_positions,
-                                        rhs_positions,
-                                        behavioral_changes,
-                                        cosmetic_changes,
-                                        lhs_semantic_map,
-                                        rhs_semantic_map,
-                                    )
-                                }
-                            }
-                            Err(tsp::ExceededParseErrorLimit(error_count)) => {
-                                let file_format = FileFormat::TextFallback {
-                                    reason: format!(
-                                        "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
-                                        error_count,
-                                        language_name(language),
-                                        if error_count == 1 { "" } else { "s" }
-                                    ),
-                                };
-                                if diff_options.check_only {
-                                    return check_only_text(
-                                        &file_format,
-                                        display_path,
-                                        extra_info,
-                                        lhs_src,
-                                        rhs_src,
-                                    );
-                                }
-                                let lhs_positions =
-                                    line_parser::change_positions(lhs_src, rhs_src);
-                                let rhs_positions =
-                                    line_parser::change_positions(rhs_src, lhs_src);
-                                (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
+                                (
+                                    FileFormat::SupportedLanguage(language),
+                                    lhs_positions,
+                                    rhs_positions,
+                                    behavioral_changes,
+                                    cosmetic_changes,
+                                    lhs_semantic_map,
+                                    rhs_semantic_map,
+                                )
                             }
                         }
-                    }
-                    Err(tsp::ExceededByteLimit(num_bytes)) => {
-                        let format_options = FormatSizeOptions::from(BINARY).decimal_places(1);
-                        let file_format = FileFormat::TextFallback {
-                            reason: format!(
-                                "{} exceeded DFT_BYTE_LIMIT",
-                                &format_size(num_bytes, format_options)
-                            ),
-                        };
-                        if diff_options.check_only {
-                            return check_only_text(
-                                &file_format,
-                                display_path,
-                                extra_info,
-                                lhs_src,
-                                rhs_src,
-                            );
+                        Err(tsp::ExceededParseErrorLimit(error_count)) => {
+                            let file_format = FileFormat::TextFallback {
+                                reason: format!(
+                                    "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
+                                    error_count,
+                                    language_name(language),
+                                    if error_count == 1 { "" } else { "s" }
+                                ),
+                            };
+                            if diff_options.check_only {
+                                return check_only_text(
+                                    &file_format, display_path, extra_info, lhs_src, rhs_src,
+                                );
+                            }
+                            let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                            let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                            (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
                         }
-                        let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
-                        let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
-                        (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
                     }
                 }
+                Err(tsp::ExceededByteLimit(num_bytes)) => {
+                    let format_options = FormatSizeOptions::from(BINARY).decimal_places(1);
+                    let file_format = FileFormat::TextFallback {
+                        reason: format!(
+                            "{} exceeded DFT_BYTE_LIMIT",
+                            &format_size(num_bytes, format_options)
+                        ),
+                    };
+                    if diff_options.check_only {
+                        return check_only_text(
+                            &file_format, display_path, extra_info, lhs_src, rhs_src,
+                        );
+                    }
+                    let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                    let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                    (file_format, lhs_positions, rhs_positions, vec![], vec![], None, None)
+                }
             }
-        };
+        }
+    };
 
     let opposite_to_lhs = opposite_positions(&lhs_positions);
     let opposite_to_rhs = opposite_positions(&rhs_positions);
@@ -1006,6 +1011,14 @@ fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
                     match summary.file_format {
                         _ if summary.lhs_src == summary.rhs_src => {
                             println!("No changes.\n");
+                        }
+                        FileFormat::SupportedLanguage(_)
+                            if summary.has_byte_changes.is_some() =>
+                        {
+                            // Byte-level differences exist but were normalized
+                            // away by semantic normalization — the files are
+                            // syntactically different but semantically equivalent.
+                            println!("Semantically equivalent (syntactic differences normalized).\n");
                         }
                         FileFormat::SupportedLanguage(_) => {
                             println!("No syntactic changes.\n");

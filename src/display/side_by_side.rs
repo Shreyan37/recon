@@ -10,7 +10,7 @@ use crate::constants::Side;
 use crate::display::context::all_matched_lines_filled;
 use crate::display::hunks::{matched_lines_indexes_for_hunk, Hunk};
 use crate::display::style::{
-    self, apply_colors, apply_line_number_color, color_positions, novel_style, replace_tabs,
+    self, apply_line_number_color, color_positions, novel_style, replace_tabs,
     split_and_apply, BackgroundColor,
 };
 use crate::hash::{DftHashMap, DftHashSet};
@@ -407,50 +407,6 @@ pub(crate) fn print(
         display_options.num_context_lines,
     );
 
-    let (lhs_colored_lines, rhs_colored_lines) = if display_options.use_color {
-        (
-            apply_colors(
-                lhs_src,
-                Side::Left,
-                display_options.syntax_highlight,
-                file_format,
-                display_options.background_color,
-                lhs_mps,
-                lhs_semantic_map,
-            ),
-            apply_colors(
-                rhs_src,
-                Side::Right,
-                display_options.syntax_highlight,
-                file_format,
-                display_options.background_color,
-                rhs_mps,
-                rhs_semantic_map,
-            ),
-        )
-    } else {
-        (
-            split_on_newlines(lhs_src)
-                .map(|s| format!("{}\n", s))
-                .collect(),
-            split_on_newlines(rhs_src)
-                .map(|s| format!("{}\n", s))
-                .collect(),
-        )
-    };
-
-    let lhs_colored_lines: Vec<_> = lhs_colored_lines
-        .iter()
-        .map(|l| replace_tabs(l, display_options.tab_width))
-        .collect();
-    let rhs_colored_lines: Vec<_> = rhs_colored_lines
-        .iter()
-        .map(|l| replace_tabs(l, display_options.tab_width))
-        .collect();
-
-    // REMOVED: Early returns for empty files - always render side-by-side
-
-    // TODO: this is largely duplicating the `apply_colors` logic.
     let (lhs_highlights, rhs_highlights) = if display_options.use_color {
         highlight_positions(
             display_options.background_color,
