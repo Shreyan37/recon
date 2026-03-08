@@ -35,11 +35,7 @@ pub(crate) fn insert_deep_unchanged<'a>(
     change_map: &mut ChangeMap<'a>,
 ) {
     change_map.insert(node, ChangeKind::Unchanged(opposite_node));
-    
-    // Only recurse if both nodes are Lists with matching structure.
-    // The semantic normalizer may create nodes with different types
-    // (e.g., List vs Atom) for canonical forms, so we can't assume
-    // both sides will always match.
+
     match (node, opposite_node) {
         (
             Syntax::List {
@@ -51,21 +47,43 @@ pub(crate) fn insert_deep_unchanged<'a>(
                 ..
             },
         ) => {
-            // Only recurse if both lists have the same number of children.
-            // If the normalizer changed the structure, treat children as novel.
+            // Only recurse when child counts match.  A mismatch means the
+            // normalizer changed structure; treat children as Novel (below).
             if node_children.len() == opposite_children.len() {
                 for (child, opposite_child) in node_children.iter().zip(opposite_children) {
                     insert_deep_unchanged(child, opposite_child, change_map);
                 }
+            } else {
+                // Child counts differ: the normalizer restructured this list.
+                // Mark all children on both sides as Novel so downstream
+                // rendering never encounters unmapped nodes.
+                for child in node_children {
+                    insert_deep_novel(child, change_map);
+                }
+                for child in opposite_children {
+                    insert_deep_novel(child, change_map);
+                }
             }
         }
         (Syntax::Atom { .. }, Syntax::Atom { .. }) => {
-            // Atoms have no children, nothing to recurse into.
+            // Atoms have no children; nothing to recurse into.
         }
-        // Mismatched types (List vs Atom) - this can happen when the
-        // semantic normalizer creates canonical forms that change node types.
-        // The parent nodes are marked as Unchanged, but we don't recurse.
-        _ => {}
+        // Mismatched types (List vs Atom) — this can happen when the semantic
+        // normalizer converts a List to an Atom or vice versa.  The parent
+        // nodes are already marked Unchanged above.  We must still mark any
+        // children of the List side as Novel; otherwise downstream rendering
+        // will encounter nodes that are absent from the change map, which can
+        // cause panics or silently incorrect output.
+        (Syntax::List { children, .. }, Syntax::Atom { .. }) => {
+            for child in children {
+                insert_deep_novel(child, change_map);
+            }
+        }
+        (Syntax::Atom { .. }, Syntax::List { children, .. }) => {
+            for child in children {
+                insert_deep_novel(child, change_map);
+            }
+        }
     }
 }
 

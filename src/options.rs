@@ -29,6 +29,34 @@ pub(crate) enum ColorOutput {
     Never,
 }
 
+/// Controls how novel changes are colored in the diff output.
+///
+/// # Why this replaces two booleans
+///
+/// `DisplayOptions` previously held two separate `bool` fields:
+///   - `semantic_colors` — use behavioral/cosmetic coloring in inline/side-by-side views
+///   - `summarize_colors` — use behavioral/cosmetic coloring in summary output
+///
+/// These always moved together and had no meaningful `(false, true)` state
+/// (summarize without inline coloring was undefined behavior).  Combining them
+/// into a single enum eliminates the incoherent state and makes call-sites
+/// self-documenting.
+///
+/// # Compatibility
+///
+/// The original boolean fields are preserved as `#[inline]` accessor methods
+/// on `DisplayOptions` so that call-sites that read `display_options.semantic_colors`
+/// or `display_options.summarize_colors` continue to compile unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ColorScheme {
+    /// Standard scheme: left side in red, right side in green.
+    #[default]
+    Standard,
+    /// Semantic scheme: behavioral changes in red, cosmetic changes in blue.
+    /// Applies to both the diff view and the summary output.
+    Semantic,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DisplayOptions {
     pub(crate) background_color: BackgroundColor,
@@ -41,12 +69,28 @@ pub(crate) struct DisplayOptions {
     pub(crate) syntax_highlight: bool,
     pub(crate) sort_paths: bool,
     pub(crate) summarize: bool,
-    /// When true, color behavioral novel changes red and cosmetic novel changes
-    /// (comments, whitespace) blue, instead of the standard left=red/right=green
-    /// scheme. Has no effect when --color=never or --summarize is active.
-    pub(crate) semantic_colors: bool,
-    /// When true, color summary output: behavioral changes red, cosmetic changes blue
-    pub(crate) summarize_colors: bool,
+    /// Controls color scheme for both the diff view and summary output.
+    /// Use `semantic_colors()` / `summarize_colors()` accessors for
+    /// backward-compatible boolean reads.
+    pub(crate) color_scheme: ColorScheme,
+}
+
+impl DisplayOptions {
+    /// True when behavioral/cosmetic coloring is active for the diff view.
+    ///
+    /// Mirrors the old `semantic_colors: bool` field.
+    #[inline]
+    pub(crate) fn semantic_colors(&self) -> bool {
+        self.color_scheme == ColorScheme::Semantic
+    }
+
+    /// True when behavioral/cosmetic coloring is active for summary output.
+    ///
+    /// Mirrors the old `summarize_colors: bool` field.
+    #[inline]
+    pub(crate) fn summarize_colors(&self) -> bool {
+        self.color_scheme == ColorScheme::Semantic
+    }
 }
 
 pub(crate) const DEFAULT_TERMINAL_WIDTH: usize = 80;
@@ -64,8 +108,7 @@ impl Default for DisplayOptions {
             syntax_highlight: true,
             sort_paths: false,
             summarize: false,
-            semantic_colors: false,
-            summarize_colors: false,
+            color_scheme: ColorScheme::Standard,
         }
     }
 }
@@ -83,6 +126,27 @@ pub(crate) enum SemanticLevel {
     /// Additionally normalize structural equivalences such as loop rewrites,
     /// function-declaration vs arrow-function, and move semantics.
     Advanced,
+}
+
+impl SemanticLevel {
+    /// Parse a `--semantic-diff` argument value, returning `None` on
+    /// unrecognized input so the caller can emit a proper error.
+    ///
+    /// # Why `Option` instead of a silent fallback
+    ///
+    /// The previous implementation fell through to `SemanticLevel::None` for
+    /// any string that wasn't `"basic"` or `"advanced"`, silently discarding
+    /// a mis-typed flag.  This made typos like `--semantic-diff=basci`
+    /// completely invisible to the user.  Returning `None` lets `parse_args`
+    /// print a clear error and exit with `EXIT_BAD_ARGUMENTS`.
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "none"     => Some(Self::None),
+            "basic"    => Some(Self::Basic),
+            "advanced" => Some(Self::Advanced),
+            _          => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +170,7 @@ impl Default for DiffOptions {
             check_only: false,
             ignore_comments: false,
             strip_cr: false,
-            semantic_level: SemanticLevel::None,
+            semantic_level:SemanticLevel::Advanced,
         }
     }
 }
@@ -314,14 +378,15 @@ json: Output the results as a machine-readable JSON array with an element per fi
                 .help(
                     "Color behavioral changes red and cosmetic changes (comments, whitespace) \
                      blue, instead of the standard left=red/right=green scheme. \
-                     Has no effect with --color=never or --summarize.",
+                     Also applies to --summarize output. \
+                     Has no effect with --color=never.",
                 ),
         )
         .arg(
             Arg::new("semantic-diff")
                 .long("semantic-diff")
                 .value_name("LEVEL")
-                .default_value("none")
+                .default_value("advanced")
                 .env("DFT_SEMANTIC_DIFF")
                 .help(
                     "Apply language-specific semantic normalization before diffing. \
@@ -336,7 +401,8 @@ json: Output the results as a machine-readable JSON array with an element per fi
                 .long("summarize-colors")
                 .action(ArgAction::SetTrue)
                 .env("DFT_SUMMARIZE_COLORS")
-                .help("Show summary with colored output: behavioral changes in red, cosmetic changes in blue"),
+                .help("Show summary with colored output: behavioral changes in red, cosmetic changes in blue. \
+                       Equivalent to --semantic-colors when used with --summarize."),
         )
         .arg(
             Arg::new("override")
@@ -864,8 +930,14 @@ pub(crate) fn parse_args() -> Mode {
 
     let sort_paths = matches.get_flag("sort-paths");
     let summarize = matches.get_flag("summarize");
-    let semantic_colors = matches.get_flag("semantic-colors");
-    let summarize_colors = matches.get_flag("summarize-colors");
+
+    // --semantic-colors and --summarize-colors both activate the Semantic
+    // color scheme.  Accepting either flag means the user opts in.
+    let color_scheme = if matches.get_flag("semantic-colors") || matches.get_flag("summarize-colors") {
+        ColorScheme::Semantic
+    } else {
+        ColorScheme::Standard
+    };
 
     let graph_limit = *matches
         .get_one("graph-limit")
@@ -892,13 +964,28 @@ pub(crate) fn parse_args() -> Mode {
     let strip_cr = matches.get_one::<String>("strip-cr").map(|s| s.as_str()) == Some("on");
     let check_only = matches.get_flag("check-only");
 
-    let semantic_level = match matches
-        .get_one::<String>("semantic-diff")
-        .map(|s| s.as_str())
-    {
-        Some("basic") => SemanticLevel::Basic,
-        Some("advanced") => SemanticLevel::Advanced,
-        _ => SemanticLevel::None,
+    // Parse --semantic-diff, rejecting unrecognized values with a clear error
+    // instead of silently falling back to None (which would make typos like
+    // `--semantic-diff=basci` completely invisible).
+    let semantic_level = {
+        let raw = matches
+            .get_one::<String>("semantic-diff")
+            .map(|s| s.as_str())
+            .unwrap_or("none");
+        match SemanticLevel::from_str(raw) {
+            Some(level) => level,
+            None => {
+                print_error(
+                    &format!(
+                        "Unknown --semantic-diff level '{}'. \
+                         Valid values are: none, basic, advanced.\n",
+                        raw
+                    ),
+                    use_color,
+                );
+                std::process::exit(EXIT_BAD_ARGUMENTS);
+            }
+        }
     };
 
     let diff_options = DiffOptions {
@@ -979,8 +1066,7 @@ pub(crate) fn parse_args() -> Mode {
                     syntax_highlight,
                     sort_paths,
                     summarize,
-                    semantic_colors,
-                    summarize_colors,
+                    color_scheme,
                 };
 
                 let display_path = path.to_string_lossy().to_string();
@@ -1035,8 +1121,7 @@ pub(crate) fn parse_args() -> Mode {
         syntax_highlight,
         sort_paths,
         summarize,
-        semantic_colors,
-        summarize_colors,
+        color_scheme,
     };
 
     Mode::Diff {
@@ -1098,5 +1183,25 @@ mod tests {
     fn test_detect_display_width() {
         // Basic smoke test.
         assert!(detect_terminal_width() > 10);
+    }
+
+    #[test]
+    fn test_semantic_level_from_str() {
+        assert_eq!(SemanticLevel::from_str("none"),     Some(SemanticLevel::None));
+        assert_eq!(SemanticLevel::from_str("basic"),    Some(SemanticLevel::Basic));
+        assert_eq!(SemanticLevel::from_str("advanced"), Some(SemanticLevel::Advanced));
+        assert_eq!(SemanticLevel::from_str("basci"),    None);
+        assert_eq!(SemanticLevel::from_str(""),         None);
+    }
+
+    #[test]
+    fn test_color_scheme_accessors() {
+        let mut opts = DisplayOptions::default();
+        assert!(!opts.semantic_colors());
+        assert!(!opts.summarize_colors());
+
+        opts.color_scheme = ColorScheme::Semantic;
+        assert!(opts.semantic_colors());
+        assert!(opts.summarize_colors());
     }
 }

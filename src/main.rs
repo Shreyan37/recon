@@ -42,7 +42,7 @@ use display::style::print_warning;
 use log::info;
 use options::{FilePermissions, USAGE};
 
-use crate::classify::{build_semantic_map_for_side, MatchedPosExt as _};
+use crate::classify::build_semantic_map_for_side;
 use crate::conflicts::{apply_conflict_markers, START_LHS_MARKER};
 use crate::diff::changes::ChangeMap;
 use crate::diff::dijkstra::ExceededGraphLimit;
@@ -541,37 +541,39 @@ fn check_only_text(
 
 /// Categorize novel positions into behavioral and cosmetic changes.
 ///
-/// FIX 1: Added `classify::is_import_change` and `classify::is_formatting_change`
-/// to the classification chain so import-only diffs and trailing-comma diffs are
-/// reported as cosmetic in `--summarize` mode, consistent with how
-/// `build_semantic_map_for_side` classifies them for `--semantic-colors`.
-fn categorize_changes(
+/// `lhs_nodes` / `rhs_nodes` are the parsed syntax trees for each side.
+/// Passing them enables the AST-primary path inside `is_import_change`, which
+/// correctly handles re-export forms like `export { foo } from 'bar'` that the
+/// text fallback misses.  Previously every call passed `None`, so only the
+/// text fallback fired.
+fn categorize_changes<'s>(
     lhs_positions: &[MatchedPos],
     rhs_positions: &[MatchedPos],
     lhs_src: &str,
     rhs_src: &str,
     lhs_comments: &[MatchedPos],
     rhs_comments: &[MatchedPos],
+    lhs_nodes: &[&'s crate::parse::syntax::Syntax<'s>],
+    rhs_nodes: &[&'s crate::parse::syntax::Syntax<'s>],
 ) -> (Vec<classify::ChangeSpan>, Vec<classify::ChangeSpan>) {
-    let mut behavioral: Vec<MatchedPos> = Vec::new();
-    let mut cosmetic: Vec<MatchedPos> = Vec::new();
+    let mut behavioral_mps: Vec<MatchedPos> = Vec::new();
+    let mut cosmetic_mps: Vec<MatchedPos> = Vec::new();
 
     let novel_rhs: Vec<MatchedPos> = rhs_positions
         .iter()
         .filter(|p| p.kind.is_novel())
         .cloned()
         .collect();
-    let merged_rhs = classify::merge_positions(novel_rhs);
 
-    for pos in &merged_rhs {
+    for pos in &novel_rhs {
         if classify::is_comment_change(pos, rhs_comments)
             || classify::is_whitespace_only_change(pos, rhs_src)
-            || classify::is_import_change(pos, rhs_src)
+            || classify::is_import_change(pos, rhs_src, Some(rhs_nodes))
             || classify::is_formatting_change(pos, rhs_src)
         {
-            cosmetic.push(pos.clone());
+            cosmetic_mps.push(pos.clone());
         } else {
-            behavioral.push(pos.clone());
+            behavioral_mps.push(pos.clone());
         }
     }
 
@@ -583,47 +585,46 @@ fn categorize_changes(
             .filter(|p| p.kind.is_novel())
             .cloned()
             .collect();
-        let merged_lhs = classify::merge_positions(novel_lhs);
 
-        for pos in &merged_lhs {
+        for pos in &novel_lhs {
             if classify::is_comment_change(pos, lhs_comments)
                 || classify::is_whitespace_only_change(pos, lhs_src)
-                || classify::is_import_change(pos, lhs_src)
+                || classify::is_import_change(pos, lhs_src, Some(lhs_nodes))
                 || classify::is_formatting_change(pos, lhs_src)
             {
-                cosmetic.push(pos.clone());
+                cosmetic_mps.push(pos.clone());
             } else {
-                behavioral.push(pos.clone());
+                behavioral_mps.push(pos.clone());
             }
         }
     } else {
         // Both sides have changes: also count LHS behavioral deletions so
-        // that --summarize doesn't miss removed code (e.g. a deleted
-        // security check).
+        // that --summarize doesn't miss removed code.
         let novel_lhs: Vec<MatchedPos> = lhs_positions
             .iter()
             .filter(|p| p.kind.is_novel())
             .cloned()
             .collect();
-        let merged_lhs = classify::merge_positions(novel_lhs);
 
-        for pos in &merged_lhs {
-            // Only track behavioral deletions on LHS — cosmetic-only
-            // removals (comments, imports) are already captured via RHS
-            // additions and don't need double-counting.
+        for pos in &novel_lhs {
+            // Only track behavioral deletions on LHS
             let is_cosmetic = classify::is_comment_change(pos, lhs_comments)
                 || classify::is_whitespace_only_change(pos, lhs_src)
-                || classify::is_import_change(pos, lhs_src)
+                || classify::is_import_change(pos, lhs_src, Some(lhs_nodes))
                 || classify::is_formatting_change(pos, lhs_src);
             if !is_cosmetic {
-                behavioral.push(pos.clone());
+                behavioral_mps.push(pos.clone());
             }
         }
     }
 
+    // Convert MatchedPos to ChangeSpan, then merge consecutive lines
+    let behavioral_spans = classify::merge_positions(behavioral_mps);
+    let cosmetic_spans = classify::merge_positions(cosmetic_mps);
+
     (
-        classify::merge_spans_by_line(classify::merge_consecutive_lines(behavioral)),
-        classify::merge_consecutive_lines(classify::merge_positions(cosmetic)),
+        classify::merge_consecutive_lines(behavioral_spans),
+        classify::merge_consecutive_lines(cosmetic_spans),
     )
 }
 
@@ -708,10 +709,13 @@ fn diff_file_content(
                             if diff_options.semantic_level != crate::options::SemanticLevel::None {
                                 crate::parse::semantic_normalizer::normalize_all(
                                     language,
+                                    diff_options.semantic_level,
                                     &mut lhs,
                                     &mut rhs,
                                     &arena,
                                 );
+                                // Re-run init_all_info after normalisation.
+                                syntax::init_all_info(&lhs, &rhs);
                             }
 
                             if diff_options.check_only {
@@ -802,7 +806,7 @@ fn diff_file_content(
                                 // Fetch comment positions once, shared by both
                                 // --summarize and --semantic-colors.
                                 let need_comments = (display_options.summarize
-                                    || (display_options.semantic_colors
+                                    || (display_options.semantic_colors()
                                         && display_options.use_color))
                                     && !diff_options.ignore_comments;
 
@@ -824,17 +828,15 @@ fn diff_file_content(
                                             rhs_src,
                                             &lhs_comments,
                                             &rhs_comments,
+                                            lhs.as_slice(),
+                                            rhs.as_slice(),
                                         )
                                     } else {
                                         (vec![], vec![])
                                     };
 
-                                // FIX 2 & 3: build_semantic_map_for_side now takes two extra
-                                // optional arguments: change_map and syntax_nodes. Pass the
-                                // change_map for ReplacedComment/ReplacedString detection.
-                                // syntax_nodes are the flat node slices from lhs/rhs.
                                 let (lhs_semantic_map, rhs_semantic_map) =
-                                    if display_options.semantic_colors
+                                    if display_options.semantic_colors()
                                         && display_options.use_color
                                         && !display_options.summarize
                                     {
@@ -1015,9 +1017,6 @@ fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
                         FileFormat::SupportedLanguage(_)
                             if summary.has_byte_changes.is_some() =>
                         {
-                            // Byte-level differences exist but were normalized
-                            // away by semantic normalization — the files are
-                            // syntactically different but semantically equivalent.
                             println!("Semantically equivalent (syntactic differences normalized).\n");
                         }
                         FileFormat::SupportedLanguage(_) => {

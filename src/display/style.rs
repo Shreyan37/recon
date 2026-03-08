@@ -264,12 +264,12 @@ pub(crate) fn novel_style(style: Style, side: Side, background: BackgroundColor)
     if background.is_dark() {
         match side {
             Side::Left => style.bright_red(),
-            Side::Right => style.bright_green(),
+            Side::Right => style.bright_red(),
         }
     } else {
         match side {
             Side::Left => style.red(),
-            Side::Right => style.green(),
+            Side::Right => style.red(),
         }
     }
 }

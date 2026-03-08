@@ -114,7 +114,7 @@ pub fn print_summary(diff_result: &DiffResult, display_options: &DisplayOptions)
     }
 
     if behavioral_count > 0 {
-        let behavior_label = if display_options.summarize_colors && display_options.use_color {
+        let behavior_label = if display_options.summarize_colors() && display_options.use_color {
             format!(
                 "{} behavioral {}:",
                 behavioral_count.to_string().red(),
@@ -134,7 +134,7 @@ pub fn print_summary(diff_result: &DiffResult, display_options: &DisplayOptions)
     }
 
     if cosmetic_count > 0 {
-        let cosmetic_label = if display_options.summarize_colors && display_options.use_color {
+        let cosmetic_label = if display_options.summarize_colors() && display_options.use_color {
             format!(
                 "{} cosmetic {}:",
                 cosmetic_count.to_string().blue(),
