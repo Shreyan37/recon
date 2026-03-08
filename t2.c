@@ -4,27 +4,18 @@
 #include <stdlib.h>
 
 void example(int *p, int x, int y) {
-    // Null pointer – different form
     int *ptr = (void*)0;
-    if (NULL == ptr) {   // reversed order
+    if (NULL == ptr) {  
         printf("ptr is null\n");
     }
 
-    // sizeof – different syntax
     size_t s = sizeof int;
     printf("sizeof int = %zu\n", s);
 
-    // fprintf instead of printf
     fprintf(stdout, "x = %d, y = %d\n", x, y);
 
-    // assert (unchanged)
-
-    // memset zero (unchanged)
-
-    // double negation – changed (behavioral)
     int flag = x;
-
-    // comparisons
+    int z = 4*2*3*1;
     if (x == y) {
         printf("equal\n");
     }
@@ -34,8 +25,6 @@ void example(int *p, int x, int y) {
     if (x < y) {
         printf("less\n");
     }
-
-    // De Morgan – alternate form of NAND
     if (!x || !y) {
         printf("nand\n");
     }

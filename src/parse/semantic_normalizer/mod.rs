@@ -170,6 +170,24 @@ fn normalize_node<'a>(
 // Rename detection (Advanced only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Detect likely renames by comparing identifier counts on both sides.
+///
+/// # Limitations
+///
+/// This is a simple count-based heuristic that can produce false positives
+/// (e.g., when two different identifiers happen to appear the same number
+/// of times) or false negatives (when a renamed identifier's count changes
+/// due to other edits).  It is intended only for the Advanced level, where
+/// the user accepts that some semantic equivalences may be hidden.
+///
+/// The algorithm:
+/// 1. Count occurrences of each identifier on both sides.
+/// 2. For each identifier on LHS that does not have the same count on RHS,
+///    look for an identifier on RHS with exactly the same count.
+/// 3. If exactly one such candidate exists, assume it's a rename.
+///
+/// This simple approach avoids more complex context analysis, which would
+/// require a full syntax diff and is out of scope for the rename pass.
 fn detect_renames<'a>(
     lhs: &[&'a Syntax<'a>],
     rhs: &[&'a Syntax<'a>],
@@ -404,6 +422,11 @@ pub(crate) fn parent_kind<'a>(parent: Option<&'a Syntax<'a>>) -> &'static str {
     parent.map_or("", node_kind)
 }
 
+/// Unwrap a single layer of parentheses, if present.
+///
+/// This handles both explicit parentheses (`( expr )`) and the special case
+/// where a list node has no open/close content but a single child (used for
+/// synthetic nodes).  It recurses only one level; callers may need to loop.
 pub(crate) fn unwrap_paren<'a>(node: &'a Syntax<'a>) -> &'a Syntax<'a> {
     let mut current = node;
     loop {

@@ -143,6 +143,14 @@ pub fn merge_consecutive_lines(spans: Vec<ChangeSpan>) -> Vec<ChangeSpan> {
 /// we call the cheapest checks first and skip the remaining ones once any
 /// returns `true`.  Conversely, `Behavioral` is the default; we only write
 /// `Cosmetic` when at least one classifier fires.
+///
+/// # Note on import detection performance
+///
+/// The AST-based `is_import_change` may traverse the syntax tree for each
+/// position, which can be expensive for large diffs.  In practice the tree
+/// depth is limited, and positions are few, so this is acceptable.  If
+/// performance becomes an issue, we could precompute a spatial index of
+/// import nodes (e.g., an interval tree) and query in O(log n) per position.
 pub fn build_semantic_map_for_side<'a>(
     positions: &[MatchedPos],
     src: &str,
